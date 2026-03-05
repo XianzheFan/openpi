@@ -2,5 +2,6 @@
 	path = third_party/aloha
 	url = https://github.com/Physical-Intelligence/aloha.git
 [submodule "third_party/libero"]
-	path = third_party/libero
-	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
+    path = third_party/libero
+    url = https://github.com/XianzheFan/LIBERO.git
+    branch = sde
