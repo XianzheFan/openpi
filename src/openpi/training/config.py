@@ -112,7 +112,7 @@ class ModelTransformFactory(GroupFactory):
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
         match model_config.model_type:
-            case _model.ModelType.PI0:
+            case _model.ModelType.PI0 | _model.ModelType.PI0_SDE:
                 return _transforms.Group(
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
@@ -123,7 +123,7 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                 )
-            case _model.ModelType.PI05:
+            case _model.ModelType.PI05 | _model.ModelType.PI05_SDE:
                 assert isinstance(model_config, pi0_config.Pi0Config)
                 return _transforms.Group(
                     inputs=[

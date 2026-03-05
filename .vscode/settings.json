@@ -7,5 +7,18 @@
         "src"
     ],
     "python.testing.unittestEnabled": false,
-    "python.testing.pytestEnabled": true
+    "python.testing.pytestEnabled": true,
+    "remote.downloadExtensionsLocally": true,
+    "remote.SSH.useLocalServer": false,
+    "remote.SSH.connectTimeout": 120,
+    "remote.SSH.remotePlatform": {
+        "jumphost-ts": "linux",
+        "draco-oci-dc-01.draco-oci-iad.nvidia.com": "linux"
+    },
+    "remote.SSH.showLoginTerminal": true,
+    "remote.SSH.useExecServer": false,
+    "launch": {
+        "configurations": [],
+        "compounds": []
+    }
 }

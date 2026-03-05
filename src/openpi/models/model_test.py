@@ -5,6 +5,7 @@ import pytest
 from openpi.models import model as _model
 from openpi.models import pi0_config
 from openpi.models import pi0_fast
+from openpi.models import pi0_sde
 from openpi.shared import download
 from openpi.shared import nnx_utils
 

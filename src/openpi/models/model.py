@@ -32,6 +32,8 @@ class ModelType(enum.Enum):
 
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
+    PI0_SDE = "pi0_sde"
+    PI05_SDE = "pi05_sde"
     PI05 = "pi05"
 
 
