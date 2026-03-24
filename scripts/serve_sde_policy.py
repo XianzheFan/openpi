@@ -54,6 +54,11 @@ class Args:
     # Specifies how to load the policy. If not provided, the default policy for the environment will be used.
     policy: Checkpoint | Default = dataclasses.field(default_factory=Default)
 
+    # SDE sampling parameters. Higher noise_level → more diverse trajectories.
+    noise_level: float = 0.5
+    # Number of denoising steps.
+    num_steps: int = 3
+
 
 # Default checkpoints that should be used for each environment.
 DEFAULT_CHECKPOINT: dict[EnvMode, Checkpoint] = {
@@ -107,9 +112,8 @@ def create_sde_policy(args: Args) -> _policy.Policy:
     new_model_config = Pi0SDEConfig(
         **model_kwargs,
         noise_method="flow_sde",
-        noise_level=0.5,
-        num_steps=5  # LIBERO_10
-        # num_steps=10
+        noise_level=args.noise_level,
+        num_steps=args.num_steps,
     )
 
     full_config = dataclasses.replace(

@@ -61,7 +61,15 @@ class Policy(BasePolicy):
             self._sample_actions = model.sample_actions
         else:
             # JAX model setup
-            self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            # Mark non-array sample_kwargs as static for jax.jit (e.g., mode: str, num_tt_samples: int).
+            static_argnames = tuple(
+                k for k, v in self._sample_kwargs.items()
+                if isinstance(v, (str, bool, int, float)) or v is None
+            )
+            self._sample_actions = nnx_utils.module_jit(
+                model.sample_actions,
+                static_argnames=static_argnames if static_argnames else None,
+            )
             self._rng = rng or jax.random.key(0)
 
     @override

@@ -66,6 +66,7 @@ cover/
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
+*.pdf
 
 # Flask stuff:
 instance/
@@ -82,7 +83,7 @@ docs/_build/
 target/
 
 # Jupyter Notebook
-.ipynb_checkpoints
+.ipynb_checkpoints/
 
 # IPython
 profile_default/
@@ -167,3 +168,4 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 .history/
+test_dreamdojo_out_libero_10/
