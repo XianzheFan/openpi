@@ -34,6 +34,12 @@ class Pi0Config(_model.BaseModelConfig):
 
     pytorch_compile_mode: str | None = "max-autotune"
 
+    # Switch head: binary classifier that predicts whether to switch to SDE policy.
+    # Only used during finetuning (training) and deployment (inference), not during data collection.
+    switch_head: bool = False
+    # Weight for the switch head BCE loss relative to the flow matching loss.
+    switch_loss_weight: float = 1.0
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)

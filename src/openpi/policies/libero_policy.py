@@ -80,6 +80,10 @@ class LiberoInputs(transforms.DataTransformFn):
         if "prompt" in data:
             inputs["prompt"] = data["prompt"]
 
+        # Switch label for switch head training (1.0 = switch to SDE, 0.0 = stay).
+        if "switch_label" in data:
+            inputs["switch_label"] = data["switch_label"]
+
         return inputs
 
 
@@ -97,4 +101,8 @@ class LiberoOutputs(transforms.DataTransformFn):
         # dimension, we need to now parse out the correct number of actions in the return dict.
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][:, :7])}
+        result = {"actions": np.asarray(data["actions"][:, :7])}
+        # Pass through switch head prediction if present.
+        if "switch" in data:
+            result["switch"] = data["switch"]
+        return result

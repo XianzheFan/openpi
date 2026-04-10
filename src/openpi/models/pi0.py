@@ -5,6 +5,7 @@ import flax.nnx as nnx
 import flax.nnx.bridge as nnx_bridge
 import jax
 import jax.numpy as jnp
+import optax
 from typing_extensions import override
 
 from openpi.models import model as _model
@@ -99,6 +100,13 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
+        # Switch head: binary classifier predicting whether to switch to SDE policy.
+        self.switch_head_enabled = config.switch_head
+        if config.switch_head:
+            self.switch_head_proj1 = nnx.Linear(paligemma_config.width, 256, rngs=rngs)
+            self.switch_head_proj2 = nnx.Linear(256, 1, rngs=rngs)
+            self.switch_loss_weight = config.switch_loss_weight
+
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
@@ -185,6 +193,19 @@ class Pi0(_model.BaseModel):
         ar_mask = jnp.array(ar_mask)
         return tokens, input_mask, ar_mask, adarms_cond
 
+    def _compute_switch_logit(
+        self, prefix_out: at.Float[at.Array, "b s emb"], prefix_mask: at.Bool[at.Array, "b s"]
+    ) -> at.Float[at.Array, "b 1"]:
+        """Compute switch head logit from mean-pooled prefix output."""
+        # Mean pool over valid prefix tokens.
+        mask_expanded = prefix_mask[..., None].astype(prefix_out.dtype)
+        pooled = jnp.sum(prefix_out * mask_expanded, axis=1) / jnp.maximum(
+            jnp.sum(mask_expanded, axis=1), 1.0
+        )
+        # MLP: hidden -> 256 -> 1
+        h = nnx.relu(self.switch_head_proj1(pooled))
+        return self.switch_head_proj2(h)
+
     @override
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
@@ -211,7 +232,17 @@ class Pi0(_model.BaseModel):
         )
         v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        flow_loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)  # shape (*b, ah)
+
+        # Add switch head loss if enabled and labels are available.
+        if self.switch_head_enabled and observation.switch_label is not None:
+            switch_logit = self._compute_switch_logit(prefix_out, prefix_mask)  # (b, 1)
+            switch_logit = switch_logit.squeeze(-1)  # (b,)
+            switch_bce = optax.sigmoid_binary_cross_entropy(switch_logit, observation.switch_label)  # (b,)
+            # Broadcast and add: each sample's switch loss is spread across its action horizon.
+            flow_loss = flow_loss + self.switch_loss_weight * switch_bce[..., None]
+
+        return flow_loss
 
     @override
     def sample_actions(
@@ -221,6 +252,7 @@ class Pi0(_model.BaseModel):
         *,
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
+        return_switch: bool = False,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
@@ -234,7 +266,7 @@ class Pi0(_model.BaseModel):
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
         prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
-        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+        (prefix_out_cached, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
         def step(carry):
             x_t, time = carry
@@ -276,4 +308,11 @@ class Pi0(_model.BaseModel):
             return time >= -dt / 2
 
         x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+
+        if return_switch and self.switch_head_enabled:
+            # Compute switch prediction from the prefix output (computed once, no extra LLM call).
+            switch_logit = self._compute_switch_logit(prefix_out_cached, prefix_mask)
+            switch_prob = jax.nn.sigmoid(switch_logit.squeeze(-1))  # (b,)
+            return x_0, switch_prob
+
         return x_0

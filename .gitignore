@@ -169,3 +169,4 @@ cython_debug/
 #.idea/
 .history/
 test_dreamdojo_out_libero_10/
+*.out

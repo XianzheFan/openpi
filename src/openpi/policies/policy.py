@@ -97,10 +97,21 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
-        outputs = {
-            "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
-        }
+        raw_result = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+
+        # Handle switch head: sample_actions returns (actions, switch_prob) when return_switch=True.
+        if isinstance(raw_result, tuple):
+            actions, switch_prob = raw_result
+            outputs = {
+                "state": inputs["state"],
+                "actions": actions,
+                "switch": switch_prob,
+            }
+        else:
+            outputs = {
+                "state": inputs["state"],
+                "actions": raw_result,
+            }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)

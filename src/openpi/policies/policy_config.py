@@ -72,6 +72,11 @@ def create_trained_policy(
         except ImportError:
             pytorch_device = "cpu"
 
+    # Auto-enable return_switch if the model has a switch head.
+    effective_sample_kwargs = dict(sample_kwargs or {})
+    if getattr(train_config.model, "switch_head", False) and "return_switch" not in effective_sample_kwargs:
+        effective_sample_kwargs["return_switch"] = True
+
     return _policy.Policy(
         model,
         transforms=[
@@ -87,7 +92,7 @@ def create_trained_policy(
             *data_config.data_transforms.outputs,
             *repack_transforms.outputs,
         ],
-        sample_kwargs=sample_kwargs,
+        sample_kwargs=effective_sample_kwargs,
         metadata=train_config.policy_metadata,
         is_pytorch=is_pytorch,
         pytorch_device=pytorch_device if is_pytorch else None,
