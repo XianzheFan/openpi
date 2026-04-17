@@ -170,3 +170,4 @@ cython_debug/
 .history/
 test_dreamdojo_out_libero_10/
 *.out
+unsloth_compiled_cache/

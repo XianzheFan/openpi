@@ -11,6 +11,59 @@ import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
 import numpy as np
 import torch
 
+# Monkey-patch lerobot to be compatible with datasets>=4.0, where
+# ds["column"] returns a Column object instead of a list of tensors.
+_orig_lerobot_init = lerobot_dataset.LeRobotDataset.__init__
+
+
+def _patched_lerobot_init(self, *args, **kwargs):
+    _orig_lerobot_init(self, *args, **kwargs)
+
+
+def _patched_init_wrapper(self, *args, **kwargs):
+    # Temporarily patch torch.stack to handle Column objects
+    _orig_stack = torch.stack
+
+    def _safe_stack(tensors, *a, **kw):
+        if not isinstance(tensors, (list, tuple)):
+            tensors = list(tensors)
+        return _orig_stack(tensors, *a, **kw)
+
+    torch.stack = _safe_stack
+    try:
+        _orig_lerobot_init(self, *args, **kwargs)
+    finally:
+        torch.stack = _orig_stack
+
+
+lerobot_dataset.LeRobotDataset.__init__ = _patched_init_wrapper
+
+_orig_get_query_timestamps = lerobot_dataset.LeRobotDataset._get_query_timestamps
+_orig_query_hf_dataset = lerobot_dataset.LeRobotDataset._query_hf_dataset
+
+
+def _patched_get_query_timestamps(self, current_ts, query_indices=None):
+    query_timestamps = {}
+    for key in self.meta.video_keys:
+        if query_indices is not None and key in query_indices:
+            timestamps = self.hf_dataset.select(query_indices[key])["timestamp"]
+            query_timestamps[key] = torch.stack(list(timestamps)).tolist()
+        else:
+            query_timestamps[key] = [current_ts]
+    return query_timestamps
+
+
+def _patched_query_hf_dataset(self, query_indices):
+    return {
+        key: torch.stack(list(self.hf_dataset.select(q_idx)[key]))
+        for key, q_idx in query_indices.items()
+        if key not in self.meta.video_keys
+    }
+
+
+lerobot_dataset.LeRobotDataset._get_query_timestamps = _patched_get_query_timestamps
+lerobot_dataset.LeRobotDataset._query_hf_dataset = _patched_query_hf_dataset
+
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
@@ -137,16 +190,40 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
-        delta_timestamps={
-            key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
-        },
-    )
+    local_dirs = data_config.local_dirs
+    if local_dirs:
+        datasets = []
+        first_meta = None
+        for local_dir in local_dirs:
+            dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=local_dir)
+            if first_meta is None:
+                first_meta = dataset_meta
+            ds = lerobot_dataset.LeRobotDataset(
+                repo_id,
+                root=local_dir,
+                delta_timestamps={
+                    key: [t / dataset_meta.fps for t in range(action_horizon)]
+                    for key in data_config.action_sequence_keys
+                },
+                video_backend="pyav",
+            )
+            datasets.append(ds)
+        dataset = datasets[0] if len(datasets) == 1 else torch.utils.data.ConcatDataset(datasets)
 
-    if data_config.prompt_from_task:
-        dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
+        if data_config.prompt_from_task and first_meta is not None:
+            dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(first_meta.tasks)])
+    else:
+        dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+        dataset = lerobot_dataset.LeRobotDataset(
+            data_config.repo_id,
+            delta_timestamps={
+                key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
+            },
+            video_backend="pyav",
+        )
+
+        if data_config.prompt_from_task:
+            dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])
 
     return dataset
 
