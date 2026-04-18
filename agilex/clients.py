@@ -33,10 +33,14 @@ class OpenpiClient:
         self,
         host: str,
         port: int,
+        mode: str | None = None,
     ) -> None:
 
         # build client to connect server policy
         self.client = websocket_client_policy.WebsocketClientPolicy(host, port)
+        # "ode" | "sde" | None. When set, injected into every request so a
+        # combined serve_combined_policy.py server can route appropriately.
+        self.mode = mode
 
     def _build_observation(self, payload) -> dict:
         images = [payload["top"], payload["left"], payload["right"]]
@@ -56,6 +60,9 @@ class OpenpiClient:
         if "action_prefix" in payload and payload["action_prefix"] is not None:
             observation["action_prefix"] = payload["action_prefix"]
             observation["delay"] = payload["delay"]
+
+        if self.mode is not None:
+            observation["mode"] = self.mode
 
         return observation
 

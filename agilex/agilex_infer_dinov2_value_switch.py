@@ -432,14 +432,24 @@ def inference_fn_sync(args, config, policy, ros_operator):
 def model_inference(args, config, ros_operator):
     import rospy
 
-    # ODE policy (with auxiliary switch head)
-    policy = OpenpiClient(host=args.host, port=args.port)
+    # In --combined mode, one server handles both ODE and SDE on args.host:args.port
+    # (see scripts/serve_combined_policy.py). Clients tag each request with "mode"
+    # so the server can dispatch. Otherwise we talk to two independent servers as before.
+    if args.combined:
+        sde_host = args.sde_host or args.host
+        sde_port = args.sde_port if args.sde_host else args.port
+        policy = OpenpiClient(host=args.host, port=args.port, mode="ode")
+        sde_policy = OpenpiClient(host=sde_host, port=sde_port, mode="sde")
+        logging.info(f"Combined policy server: {args.host}:{args.port} (ODE+SDE share weights)")
+    else:
+        # ODE policy (with auxiliary switch head)
+        policy = OpenpiClient(host=args.host, port=args.port)
 
-    # SDE policy (queried when switch head triggers)
-    sde_policy = None
-    if args.sde_host:
-        sde_policy = OpenpiClient(host=args.sde_host, port=args.sde_port)
-        logging.info(f"SDE policy connected to {args.sde_host}:{args.sde_port}")
+        # SDE policy (queried when switch head triggers)
+        sde_policy = None
+        if args.sde_host:
+            sde_policy = OpenpiClient(host=args.sde_host, port=args.sde_port)
+            logging.info(f"SDE policy connected to {args.sde_host}:{args.sde_port}")
 
     # DINOv2 value expert
     value_scorer = None
@@ -722,6 +732,9 @@ def get_arguments():
     parser.add_argument("--sde_host", type=str, default=None,
                         help="SDE policy server host (required for switch mode)")
     parser.add_argument("--sde_port", type=int, default=8001)
+    parser.add_argument("--combined", action="store_true", default=False,
+                        help="Single combined ODE+SDE server (scripts/serve_combined_policy.py). "
+                             "SDE queries are sent to --host:--port with mode='sde' unless --sde_host is set.")
     # ---- Switch head ----
     parser.add_argument("--switch_threshold", type=float, default=0.5,
                         help="Prob threshold for switching ODE → SDE")

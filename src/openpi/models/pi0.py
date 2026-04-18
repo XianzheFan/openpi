@@ -253,14 +253,17 @@ class Pi0(_model.BaseModel):
         num_steps: int | at.Int[at.Array, ""] = 10,
         noise: at.Float[at.Array, "b ah ad"] | None = None,
         return_switch: bool = False,
+        mode: str = "ode",
+        noise_level: float = 0.3,
     ) -> _model.Actions:
         observation = _model.preprocess_observation(None, observation, train=False)
         # note that we use the convention more common in diffusion literature, where t=1 is noise and t=0 is the target
         # distribution. yes, this is the opposite of the pi0 paper, and I'm sorry.
         dt = -1.0 / num_steps
         batch_size = observation.state.shape[0]
+        rng_init, rng_loop = jax.random.split(rng)
         if noise is None:
-            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+            noise = jax.random.normal(rng_init, (batch_size, self.action_horizon, self.action_dim))
 
         # first fill KV cache with a forward pass of the prefix
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
@@ -268,26 +271,18 @@ class Pi0(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         (prefix_out_cached, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
 
-        def step(carry):
-            x_t, time = carry
+        def forward_vt(x_t, time):
             suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
                 observation, x_t, jnp.broadcast_to(time, batch_size)
             )
-            # `suffix_attn_mask` is shape (b, suffix_len, suffix_len) indicating how the suffix tokens can attend to each
-            # other
             suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-            # `prefix_attn_mask` is shape (b, suffix_len, prefix_len) indicating how the suffix tokens can attend to the
-            # prefix tokens
             prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
-            # `combined_mask` is shape (b, suffix_len, prefix_len + suffix_len) indicating how the suffix tokens (which
-            # generate the queries) can attend to the full prefix + suffix sequence (which generates the keys and values)
             full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
             assert full_attn_mask.shape == (
                 batch_size,
                 suffix_tokens.shape[1],
                 prefix_tokens.shape[1] + suffix_tokens.shape[1],
             )
-            # `positions` is shape (b, suffix_len) indicating the positions of the suffix tokens
             positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
 
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
@@ -298,16 +293,36 @@ class Pi0(_model.BaseModel):
                 adarms_cond=[None, adarms_cond],
             )
             assert prefix_out is None
-            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-            return x_t + dt * v_t, time + dt
+        def ode_step(carry):
+            x_t, time, current_rng = carry
+            v_t = forward_vt(x_t, time)
+            return x_t + dt * v_t, time + dt, current_rng
+
+        def sde_step(carry):
+            x_t, time, current_rng = carry
+            step_rng, next_rng = jax.random.split(current_rng)
+            v_t = forward_vt(x_t, time)
+            # rlinf Flow SDE mixing weights (see pi0_sde.py)
+            delta = jnp.abs(dt)
+            denom = jnp.where(time >= 1.0 - 1e-4, delta, 1.0 - time)
+            sigma_i = noise_level * jnp.sqrt(time / denom)
+            x0_pred = x_t - v_t * time
+            x1_pred = x_t + v_t * (1.0 - time)
+            x0_weight = 1.0 - (time - delta)
+            x1_weight = (time - delta) - (sigma_i**2 * delta) / (2.0 * time)
+            x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
+            x_t_std = jnp.sqrt(delta) * sigma_i
+            z = jax.random.normal(step_rng, x_t.shape)
+            return x_t_mean + x_t_std * z, time + dt, next_rng
 
         def cond(carry):
-            x_t, time = carry
-            # robust to floating-point error
+            _, time, _ = carry
             return time >= -dt / 2
 
-        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        step_fn = sde_step if mode == "sde" else ode_step
+        x_0, _, _ = jax.lax.while_loop(cond, step_fn, (noise, 1.0, rng_loop))
 
         if return_switch and self.switch_head_enabled:
             # Compute switch prediction from the prefix output (computed once, no extra LLM call).
