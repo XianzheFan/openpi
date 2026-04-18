@@ -1,5 +1,11 @@
+# -- coding: UTF-8
+"""
+#!/usr/bin/python3
+"""
+
 import argparse
 import os
+import queue
 import signal
 import sys
 import termios
@@ -7,26 +13,25 @@ import threading
 import time
 import tty
 from collections import deque
-from functools import partial
 
+import h5py
 import numpy as np
 import rospy
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from clients import OpenpiClient
 from agilex_utils import check_keyboard_input, get_config, handle_interactive_mode, process_action
-from rosoperator import RosOperator, get_ros_observation
-from rotation import abs_6d_2_abs_euler, quat_2_euler
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
+from ros_operator import RosOperator, get_ros_observation
 
 observation_window = None
 observation_window_lock = threading.Lock()
 
 shutdown_event = threading.Event()
-# When clear: inference thread blocks. When set: inference thread runs.
-inference_paused = threading.Event()
-inference_paused.clear()  # paused by default
-
-inference_stamp = 0  # the stamp of the current inference
 
 
 def _on_sigint(signum, frame):
@@ -62,11 +67,11 @@ def update_observation_window(args, config, ros_operator):
                         config["camera_names"][1]: None,
                         config["camera_names"][2]: None,
                     },
-                    "endpose": None,
+                    "eef_pose": None,
                 }
             )
 
-    img_front, img_left, img_right, puppet_arm_left, puppet_arm_right, endpose_left, endpose_right = (
+    img_front, img_left, img_right, puppet_arm_left, puppet_arm_right, puppet_arm_left_pose, puppet_arm_right_pose = (
         get_ros_observation(args, ros_operator)
     )
 
@@ -75,19 +80,12 @@ def update_observation_window(args, config, ros_operator):
         axis=0,
     )
 
-    left_pos = endpose_left.pose.position
-    left_rpy = quat_2_euler(endpose_left.pose.orientation)
-    left_gripper = puppet_arm_left.position[-1]
-    endpose_left = np.array([left_pos.x, left_pos.y, left_pos.z, left_rpy[0], left_rpy[1], left_rpy[2], left_gripper])
-
-    right_pos = endpose_right.pose.position
-    right_rpy = quat_2_euler(endpose_right.pose.orientation)
-    right_gripper = puppet_arm_right.position[-1]
-    endpose_right = np.array(
-        [right_pos.x, right_pos.y, right_pos.z, right_rpy[0], right_rpy[1], right_rpy[2], right_gripper]
+    eef_pose = ros_operator.build_puppet_arm_pose(
+        puppet_arm_left_pose,
+        puppet_arm_right_pose,
+        puppet_arm_left,
+        puppet_arm_right,
     )
-
-    endpose = np.concatenate((endpose_left, endpose_right), axis=0)
 
     with observation_window_lock:
         observation_window.append(
@@ -95,360 +93,369 @@ def update_observation_window(args, config, ros_operator):
                 "qpos": qpos,
                 "images": {
                     config["camera_names"][0]: img_front,
-                    config["camera_names"][1]: img_right,
-                    config["camera_names"][2]: img_left,
+                    config["camera_names"][1]: img_left,
+                    config["camera_names"][2]: img_right,
                 },
-                "endpose": endpose,
+                "eef_pose": eef_pose,
             }
         )
 
 
-class StreamActionBuffer:
-
-    def __init__(self, delay, exec_horizon, state_dim):
-        self.delay = delay
-        self.exec_horizon = exec_horizon
-        self.lock = threading.Lock()
-
-        self.cur_chunk = np.zeros((exec_horizon, state_dim))
-        self.next_chunk = np.zeros((exec_horizon, state_dim))
-        self.cur_len = 0
-        self.next_len = 0
-
-        self.cur_step = 0  # current step in cur_chunk
-        self.cur_stamp = 0  # indicate the origin inference stamp of the current chunk
-
-    def reset(self):
-        """Reset buffer state for a new episode."""
-        with self.lock:
-            self.cur_len = 0
-            self.next_len = 0
-            self.cur_step = 0
-            self.cur_stamp = 0
-
-    def should_launch_inference(self):
-        if self.exec_horizon > self.delay:
-            return self.cur_step == (self.exec_horizon - self.delay - 1)
-        else:
-            # continuous inference mode: launch inference when the current chunk is starting
-            return self.cur_step == 0
-
-    def integrate_first_chunk(self, actions_chunk: np.ndarray):
-        # only for the first chunk inferenced by sync inference, already selected [0:s)
-        with self.lock:
-            assert self.cur_len == 0, "cur_len should be 0 when starting"
-            assert self.cur_stamp == 0, "cur_stamp should be 0 when starting"
-            assert actions_chunk.shape[0] == self.exec_horizon, f"{actions_chunk.shape[0]} != {self.exec_horizon}"
-            self.cur_chunk[: actions_chunk.shape[0]] = actions_chunk
-            self.cur_len = self.exec_horizon
-
-    def integrate_new_chunk(self, actions_chunk: np.ndarray):
-        # only for the new chunk inferenced by async inference, already selected [d:s+d)
-        if actions_chunk is None or actions_chunk.shape[0] == 0:
-            rospy.logwarn("actions_chunk is None or len(actions_chunk) == 0 when integrating new chunk")
-            return
-        L = actions_chunk.shape[0]
-        with self.lock:
-            assert L == self.exec_horizon, f"{L} != {self.exec_horizon}"
-            if self.cur_len == 0:
-                # warning: this should not happen
-                rospy.logwarn("cur_len is 0 when integrating new chunk")
-                self.cur_chunk[:L] = actions_chunk
-                self.cur_len = L
-            else:
-                self.next_chunk[:L] = actions_chunk
-                self.next_len = L
-
-    def integrate_new_chunk_streaming(self, actions_chunk: np.ndarray, stamp: int):
-        # only for the new chunk inferenced by async streaming inference, already removed [0:d), but can be different lengths
-        if actions_chunk is None or actions_chunk.shape[0] == 0:
-            rospy.logwarn("actions_chunk is None or len(actions_chunk) == 0 when integrating new chunk")
-            return
-        L = actions_chunk.shape[0]
-        with self.lock:
-            if self.cur_len == 0:
-                # warning: this should not happen
-                rospy.logwarn("cur_len is 0 when integrating new chunk")
-                safe_L = min(L, self.exec_horizon)
-                self.cur_chunk[:safe_L] = actions_chunk[:safe_L]
-                self.cur_len = safe_L
-                print(f"cur_chunk extend to {self.cur_len} at stamp {stamp}")
-            else:
-                if self.cur_stamp == stamp:
-                    # current chunk is already executing, extend it
-                    remaining_len = self.exec_horizon - self.cur_len
-                    if remaining_len > 0:
-                        safe_L = min(L, remaining_len)
-                        self.cur_chunk[self.cur_len : self.cur_len + safe_L] = actions_chunk[:safe_L]
-                        self.cur_len += safe_L
-                        print(f"cur_chunk extend to {self.cur_len} with {safe_L} new actions at stamp {stamp}")
-                    else:
-                        print(f"cur_chunk is already enough at stamp {stamp}")
-                else:
-                    remaining_len = self.exec_horizon - self.next_len
-                    if remaining_len > 0:
-                        safe_L = min(L, remaining_len)
-                        self.next_chunk[self.next_len : self.next_len + safe_L] = actions_chunk[:safe_L]
-                        self.next_len += safe_L
-                        print(f"next_chunk extend to {self.next_len} with {safe_L}/{L} new actions at stamp {stamp}")
-                    else:
-                        print(f"next_chunk is already enough at stamp {stamp}")
-
-    def get_next_action(self):
-        with self.lock:
-            if self.cur_step >= self.cur_len:
-                return None
-
-            action = self.cur_chunk[self.cur_step]
-            self.cur_step += 1
-
-            # should only execute [0:s) of the current chunk, switch to next chunk
-            if self.cur_step == self.exec_horizon:
-                self.cur_chunk, self.next_chunk = self.next_chunk, self.cur_chunk
-                self.cur_len = self.next_len
-                self.next_len = 0
-                self.cur_step = 0
-                self.cur_stamp += 1
-
-            return action
-
-
 def inference_fn_sync(args, config, policy, ros_operator):
-    global inference_stamp
-
     update_observation_window(args, config, ros_operator)
 
     start_time = time.perf_counter()
 
     with observation_window_lock:
-        # fetch images in sequence [front, right, left]
+        # fetch images in sequence [front, left, right]
         image_arrs = [
             observation_window[-1]["images"][config["camera_names"][0]],
             observation_window[-1]["images"][config["camera_names"][1]],
             observation_window[-1]["images"][config["camera_names"][2]],
         ]
 
-        if args.ctrl_type == "joint" or args.ctrl_type == "ee6d":
-            # state: Abs Joint 14dim, ee6d also use abs joint state input (FK in model)
+        if args.ctrl_type == "joint":
+            # state: Abs Joint 14dim
             state = observation_window[-1]["qpos"]
         elif args.ctrl_type == "eef":
             # state: Abs EEF 14dim
-            state = observation_window[-1]["endpose"]
+            state = observation_window[-1]["eef_pose"]
         else:
             raise ValueError(f"Unknown ctrl_type: {args.ctrl_type}")
 
     payload = {
         "top": image_arrs[0],
-        "right": image_arrs[1],
-        "left": image_arrs[2],
+        "left": image_arrs[1],
+        "right": image_arrs[2],
         "instruction": config["language_instruction"],
         "state": state,
-        "action_prefix": None,
-        "delay": None,
     }
 
-    if args.streaming:
-        actions = policy.predict_action_streaming(payload)
-    else:
-        actions = policy.predict_action(payload)
-    print(f"[Sync   {inference_stamp:2d}] Model inference time: {(time.perf_counter() - start_time)*1000:.3f} ms")
-    inference_stamp += 1
+    actions = policy.predict_action(payload)
+    print(f"Model inference time: {(time.perf_counter() - start_time)*1000:.3f} ms")
 
     return actions
 
 
-def inference_fn_async(args, config, policy, ros_operator, action_buffer):
-    global inference_stamp
+def _next_episode_index(dataset_dir):
+    """Pick the next episode_<idx>.hdf5 index given existing files in dataset_dir."""
+    if not os.path.exists(dataset_dir):
+        return 0
+    indices = []
+    for fname in os.listdir(dataset_dir):
+        if fname.startswith("episode_") and fname.endswith(".hdf5"):
+            try:
+                indices.append(int(fname.replace("episode_", "").replace(".hdf5", "")))
+            except ValueError:
+                continue
+    return max(indices) + 1 if indices else 0
 
-    while not rospy.is_shutdown():
+
+def _save_rollout_hdf5(
+    dataset_path,
+    camera_names,
+    frames_by_cam,
+    qpos_list,
+    eef_list,
+    action_list,
+    meta_attrs,
+):
+    """Write one rollout episode in the aloha-style HDF5 layout used by collect_data_new.py."""
+    data_size = len(action_list)
+    if data_size == 0:
+        print(f"[Rollout] No frames to save for {dataset_path}; skipping")
+        return
+
+    t0 = time.time()
+    with h5py.File(dataset_path, "w", rdcc_nbytes=1024**2 * 2) as root:
+        root.attrs["sim"] = False
+        root.attrs["compress"] = False
+        for k, v in meta_attrs.items():
+            root.attrs[k] = v
+
+        obs = root.create_group("observations")
+        image_grp = obs.create_group("images")
+        for cam_name in camera_names:
+            frames = frames_by_cam[cam_name]
+            assert len(frames) == data_size, (
+                f"cam {cam_name}: {len(frames)} frames vs {data_size} actions"
+            )
+            h, w = frames[0].shape[:2]
+            ds = image_grp.create_dataset(
+                cam_name,
+                (data_size, h, w, 3),
+                dtype="uint8",
+                chunks=(1, h, w, 3),
+            )
+            ds[...] = np.stack(frames).astype(np.uint8)
+
+        obs.create_dataset("qpos", (data_size, 14))[...] = np.stack(qpos_list)
+        obs.create_dataset("eef_pose", (data_size, 14))[...] = np.stack(eef_list)
+        root.create_dataset("action", (data_size, 14))[...] = np.stack(action_list)
+
+    print(f"\033[32m[Rollout] Saved {data_size} steps in {time.time() - t0:.1f}s -> {dataset_path}\033[0m")
+
+
+class AsyncRolloutRecorder:
+    """Off-hot-path rollout recorder.
+
+    Main thread calls `record_step` with image *references* (no copy) plus
+    small state/action arrays. A background worker drains the queue, buffers
+    the episode, and writes the HDF5 file on `end_episode` without blocking
+    the publish loop. `record_step` never blocks: if the queue fills up it
+    drops the frame rather than stall inference.
+    """
+
+    _SHUTDOWN = object()
+
+    def __init__(self, camera_names, rollout_dir, start_idx, queue_size=4000):
+        self._camera_names = list(camera_names)
+        self._rollout_dir = rollout_dir
+        self._episode_idx = start_idx
+        self._queue = queue.Queue(maxsize=queue_size)
+        self._dropped = 0
+        self._worker = threading.Thread(target=self._run, daemon=True)
+        self._worker.start()
+
+    def record_step(self, imgs, qpos, eef, action):
         try:
-            inference_paused.wait()
+            self._queue.put_nowait(("step", imgs, qpos, eef, action))
+        except queue.Full:
+            self._dropped += 1
 
-            print(f"[Async  {inference_stamp:2d}] Start inference")
+    def end_episode(self, meta_attrs):
+        self._queue.put(("end", meta_attrs))
 
-            d = config["delay"]
-            s = config["exec_horizon"]
+    def close(self):
+        self._queue.put((self._SHUTDOWN, None))
+        self._worker.join()
 
-            # Use action_buffer's internal lock to safely read cur_chunk
-            with action_buffer.lock:
-                if action_buffer.cur_chunk is None or config["mode"] == "naive":
-                    action_prefix = None
-                    if config["mode"] == "rtc":
-                        rospy.logwarn("RTC mode: action_prefix is None")
-                else:
-                    action_prefix = action_buffer.cur_chunk[(s - d) : s].copy()  # last d actions of the current chunk
-                    assert action_prefix.shape[0] == d, f"{action_prefix.shape[0]} != {d}"
+    def _run(self):
+        # Stream per-frame to HDF5 so memory stays O(1) instead of growing
+        # with episode length. Accumulating GB of frame refs caused ROS
+        # callback allocations / GC pauses to disturb the publish loop.
+        h5_file = None
+        dataset_path = None
+        img_ds = None
+        qpos_ds = None
+        eef_ds = None
+        action_ds = None
+        step_count = 0
+        t_open = 0.0
 
-            update_observation_window(args, config, ros_operator)
-
-            start_time = time.perf_counter()
-
-            with observation_window_lock:
-                # fetch images in sequence [front, right, left]
-                image_arrs = [
-                    observation_window[-1]["images"][config["camera_names"][0]],
-                    observation_window[-1]["images"][config["camera_names"][1]],
-                    observation_window[-1]["images"][config["camera_names"][2]],
-                ]
-
-                if args.ctrl_type == "joint" or args.ctrl_type == "ee6d":
-                    # state: Abs Joint 14dim, ee6d also use abs joint state input (FK in model)
-                    state = observation_window[-1]["qpos"]
-                elif args.ctrl_type == "eef":
-                    # state: Abs EEF 14dim
-                    state = observation_window[-1]["endpose"]
-                else:
-                    raise ValueError(f"Unknown ctrl_type: {args.ctrl_type}")
-
-            payload = {
-                "top": image_arrs[0],
-                "right": image_arrs[1],
-                "left": image_arrs[2],
-                "instruction": config["language_instruction"],
-                "state": state,
-                "action_prefix": action_prefix,
-                "delay": np.array(d),
-            }
-
-            on_actions_ready = partial(action_buffer.integrate_new_chunk_streaming, stamp=inference_stamp)
-
-            if args.streaming:
-                policy.predict_action_streaming(payload, on_actions_ready=on_actions_ready)
-                print(
-                    f"[Async  {inference_stamp:2d}] Model inference time: {(time.perf_counter() - start_time)*1000:.3f} ms"
+        def _open_episode(first_imgs):
+            nonlocal h5_file, dataset_path, img_ds, qpos_ds, eef_ds, action_ds, step_count, t_open
+            idx = self._episode_idx
+            dataset_path = os.path.join(self._rollout_dir, f"episode_{idx}.hdf5")
+            h5_file = h5py.File(dataset_path, "w", rdcc_nbytes=1024**2 * 2)
+            h5_file.attrs["sim"] = False
+            h5_file.attrs["compress"] = False
+            obs = h5_file.create_group("observations")
+            image_grp = obs.create_group("images")
+            img_ds = {}
+            for c in self._camera_names:
+                h, w = first_imgs[c].shape[:2]
+                img_ds[c] = image_grp.create_dataset(
+                    c, shape=(0, h, w, 3), maxshape=(None, h, w, 3),
+                    dtype="uint8", chunks=(1, h, w, 3),
                 )
-            else:
-                actions = policy.predict_action(payload)
-                print(
-                    f"[Async  {inference_stamp:2d}] Model inference time: {(time.perf_counter() - start_time)*1000:.3f} ms"
-                )
+            qpos_ds = obs.create_dataset(
+                "qpos", shape=(0, 14), maxshape=(None, 14),
+                dtype="float32", chunks=(1, 14),
+            )
+            eef_ds = obs.create_dataset(
+                "eef_pose", shape=(0, 14), maxshape=(None, 14),
+                dtype="float32", chunks=(1, 14),
+            )
+            action_ds = h5_file.create_dataset(
+                "action", shape=(0, 14), maxshape=(None, 14),
+                dtype="float32", chunks=(1, 14),
+            )
+            step_count = 0
+            t_open = time.time()
 
-                if actions is not None and len(actions) > 0:
-                    action_buffer.integrate_new_chunk(actions[d : s + d])
-                else:
-                    print("actions is None or len(actions) == 0")
+        def _close_episode(meta):
+            nonlocal h5_file, dataset_path, img_ds, qpos_ds, eef_ds, action_ds, step_count
+            if h5_file is None:
+                return
+            for k, v in meta.items():
+                h5_file.attrs[k] = v
+            h5_file.close()
+            print(f"\033[32m[Rollout] Saved {step_count} steps in {time.time() - t_open:.1f}s -> {dataset_path}\033[0m")
+            self._episode_idx += 1
+            h5_file = None
+            dataset_path = None
+            img_ds = qpos_ds = eef_ds = action_ds = None
+            step_count = 0
 
-            inference_stamp += 1
-            inference_paused.clear()
-
-        except Exception as e:
-            rospy.logwarn(f"[inference_fn_async] {e}")
-            time.sleep(0.1)
-            continue
-
-
-def start_inference_thread(args, config, policy, ros_operator, action_buffer):
-    inference_thread = threading.Thread(
-        target=inference_fn_async, args=(args, config, policy, ros_operator, action_buffer)
-    )
-    inference_thread.daemon = True
-    inference_thread.start()
+        while True:
+            item = self._queue.get()
+            kind = item[0]
+            if kind is self._SHUTDOWN:
+                if h5_file is not None:
+                    h5_file.close()
+                break
+            if kind == "step":
+                _, imgs, qpos, eef, action = item
+                try:
+                    if h5_file is None:
+                        _open_episode(imgs)
+                    n = step_count + 1
+                    for c in self._camera_names:
+                        img_ds[c].resize((n, *img_ds[c].shape[1:]))
+                        img_ds[c][step_count] = imgs[c]
+                    qpos_ds.resize((n, 14))
+                    qpos_ds[step_count] = qpos
+                    eef_ds.resize((n, 14))
+                    eef_ds[step_count] = eef
+                    action_ds.resize((n, 14))
+                    action_ds[step_count] = action
+                    step_count = n
+                except Exception as e:
+                    print(f"\033[31m[Rollout] Streaming write failed: {e}\033[0m")
+                # Drop refs so GC can reclaim the image memory this iteration.
+                item = None
+                imgs = None
+            elif kind == "end":
+                _, meta = item
+                try:
+                    _close_episode(meta)
+                except Exception as e:
+                    print(f"\033[31m[Rollout] Close failed: {e}\033[0m")
+                if self._dropped > 0:
+                    print(f"\033[33m[Rollout] Dropped {self._dropped} frames (queue full)\033[0m")
+                    self._dropped = 0
 
 
 # Main loop for the manipulation task
 def model_inference(args, config, ros_operator):
-    global inference_stamp
-
-    policy = OpenpiClient(host=args.host, port=args.port)
+    if args.model == "openpi":
+        policy = OpenpiClient(host=args.host, port=args.port)
+    else:
+        raise ValueError(f"Unknown model: {args.model}")
 
     max_publish_step = config["episode_len"]
+    chunk_size = config["chunk_size"]
 
     left0 = config["left0"]
     right0 = config["right0"]
 
-    print(config)
-
     ros_operator.puppet_arm_publish_continuous(left0, right0)
 
     print("Warmup the server...")
-    policy.warmup(rtc=(args.mode == "rtc"), streaming=args.streaming)
+    policy.warmup()
     print("Server warmed up")
+
+    instruction = config["language_instruction"]
+    camera_names = list(config["camera_names"])
+
+    recorder = None
+    if args.save_rollout:
+        rollout_dir = os.path.join(args.rollout_out_path, args.task)
+        os.makedirs(rollout_dir, exist_ok=True)
+        start_idx = _next_episode_index(rollout_dir)
+        recorder = AsyncRolloutRecorder(camera_names, rollout_dir, start_idx)
+        print(f"[Rollout] Async recorder writing HDF5 episodes to {rollout_dir} (starting at episode_{start_idx})")
 
     input("Press enter to continue")
     task_time = time.time()
     ros_operator.puppet_arm_publish_continuous(left0, right0)
 
-    # Create action buffer once (outside the loop)
-    action_buffer = StreamActionBuffer(
-        delay=config["delay"], exec_horizon=config["exec_horizon"], state_dim=config["state_dim"]
-    )
-
-    # Start inference thread once (outside the loop)
-    start_inference_thread(args, config, policy, ros_operator, action_buffer)
-
     try:
+        user_quit = False
         # Inference loop
-        while not rospy.is_shutdown():
+        while not rospy.is_shutdown() and not user_quit:
             # The current time step
             t = 0
             rate = rospy.Rate(args.publish_rate)
 
-            # Reset observation window and action buffer for new episode
             reset_observation_window()
-            action_buffer.reset()
-
-            inference_paused.clear()
-            inference_stamp = 0
-
-            # At beginning, launch sync inference
-            actions = inference_fn_sync(args, config, policy, ros_operator)
-            action_buffer.integrate_first_chunk(actions[: config["exec_horizon"]])
-
-            last_valid_act = None
+            action_buffer = np.zeros([chunk_size, config["state_dim"]])
+            recorded_steps = 0
+            user_stopped = False
 
             while t < max_publish_step and not rospy.is_shutdown() and not shutdown_event.is_set():
-                print(
-                    f"[Step {t:4d}] cur_step={action_buffer.cur_step:3d} | cur_chunk={action_buffer.cur_len:3d} | next_chunk={action_buffer.next_len:3d} | cur_stamp={action_buffer.cur_stamp:3d}"
-                )
                 # Check for keyboard input (space to enter interactive mode)
                 key = check_keyboard_input()
                 if key == " ":
-                    inference_paused.clear()
                     result = handle_interactive_mode(task_time)
                     if result == "reset":
-                        # Reset to starting position
                         ros_operator.puppet_arm_publish_continuous(left0, right0)
-                        input("Press enter to continue")
-                        task_time = time.time()
-                        break  # Break inner loop to restart
+                        user_stopped = True
+                        break
                     elif result == "quit":
-                        return  # Exit the function entirely
+                        user_stopped = True
+                        user_quit = True
+                        break
                     # 'continue' just resumes the loop
 
-                if action_buffer.should_launch_inference() and not inference_paused.is_set():
-                    inference_paused.set()
-                    time.sleep(0.001)
+                # When coming to the end of the action chunk
+                if t % chunk_size == 0:
+                    # Start inference (also refreshes observation_window)
+                    action_buffer = inference_fn_sync(args, config, policy, ros_operator)
+                    assert action_buffer is not None, "Sync inference returned None"
+                    assert action_buffer.shape[0] >= chunk_size, (
+                        f"Action chunk length {action_buffer.shape[0]} is smaller than {chunk_size}"
+                    )
 
-                act = action_buffer.get_next_action()
+                act = action_buffer[t % chunk_size]
 
-                if act is None:
-                    rospy.logwarn(f"[Step {t:4d}] act is None")
-                    if last_valid_act is not None:
-                        act = last_valid_act
-                    else:
-                        rate.sleep()
-                        continue
+                if recorder is not None:
+                    # Cheap: grab refs under lock, copy only small state/action
+                    # arrays. Images stay as refs — the worker thread owns them
+                    # once ROS publishes new frames into fresh arrays.
+                    with observation_window_lock:
+                        cur = observation_window[-1] if observation_window else None
+                        if cur is not None:
+                            imgs_ref = {cam: cur["images"][cam] for cam in camera_names}
+                            qpos_ref = cur["qpos"]
+                            eef_ref = cur["eef_pose"]
+                        else:
+                            imgs_ref = None
+                    if (imgs_ref is not None
+                            and all(v is not None for v in imgs_ref.values())
+                            and qpos_ref is not None and eef_ref is not None):
+                        recorder.record_step(
+                            imgs_ref,
+                            np.asarray(qpos_ref, dtype=np.float32),
+                            np.asarray(eef_ref, dtype=np.float32),
+                            np.asarray(act, dtype=np.float32).copy(),
+                        )
+                        recorded_steps += 1
 
                 if args.ctrl_type == "joint":
                     left_action, right_action = process_action(config["task"], act)
                     ros_operator.puppet_arm_publish(left_action, right_action)
-                elif args.ctrl_type == "ee6d":
-                    act = abs_6d_2_abs_euler(act)
-                    left_action, right_action = process_action(config["task"], act)
-                    ros_operator.endpose_publish(left_action, right_action)
                 elif args.ctrl_type == "eef":
                     left_action, right_action = process_action(config["task"], act)
-                    ros_operator.endpose_publish(left_action, right_action)
-
-                if args.use_robot_base:
-                    vel_action = act[14:16]
-                    ros_operator.robot_base_publish(vel_action)
+                    ros_operator.puppet_arm_pose_publish(left_action, right_action)
 
                 t += 1
-                last_valid_act = act
+                print("Published Step", t)
                 rate.sleep()
+
+            if recorder is not None and recorded_steps > 0:
+                outcome = "quit" if user_quit else ("stopped" if user_stopped else "done")
+                meta_attrs = {
+                    "task": config["task"],
+                    "instruction": instruction,
+                    "ctrl_type": args.ctrl_type,
+                    "publish_rate": args.publish_rate,
+                    "chunk_size": chunk_size,
+                    "outcome": outcome,
+                    "camera_names": camera_names,
+                }
+                recorder.end_episode(meta_attrs)
+
+            if user_quit:
+                break
+            if user_stopped:
+                input("Press enter to continue")
+                task_time = time.time()
     finally:
         ros_operator.puppet_arm_publish_continuous(left0, right0)
+        if recorder is not None:
+            recorder.close()
 
 
 def get_arguments():
@@ -510,18 +517,18 @@ def get_arguments():
         required=False,
     )
     parser.add_argument(
-        "--puppet_arm_left_cmd_topic",
+        "--master_arm_left_topic",
         action="store",
         type=str,
-        help="puppet_arm_left_cmd_topic",
+        help="master_arm_left_topic",
         default="/master/joint_left",
         required=False,
     )
     parser.add_argument(
-        "--puppet_arm_right_cmd_topic",
+        "--master_arm_right_topic",
         action="store",
         type=str,
-        help="puppet_arm_right_cmd_topic",
+        help="master_arm_right_topic",
         default="/master/joint_right",
         required=False,
     )
@@ -542,56 +549,33 @@ def get_arguments():
         required=False,
     )
     parser.add_argument(
-        "--endpose_left_cmd_topic",
+        "--pos_cmd_left_topic",
         action="store",
         type=str,
-        help="endpose_left_cmd_topic",
+        help="pos_cmd_left_topic",
         default="/puppet/pos_cmd_left",
         required=False,
     )
     parser.add_argument(
-        "--endpose_right_cmd_topic",
+        "--pos_cmd_right_topic",
         action="store",
         type=str,
-        help="endpose_right_cmd_topic",
+        help="pos_cmd_right_topic",
         default="/puppet/pos_cmd_right",
         required=False,
     )
     parser.add_argument(
-        "--endpose_left_topic",
+        "--puppet_arm_left_pose_topic",
         action="store",
         type=str,
-        default="/puppet/end_pose_left",
+        default="/puppet/end_pose_euler_left",
         required=False,
     )
     parser.add_argument(
-        "--endpose_right_topic",
+        "--puppet_arm_right_pose_topic",
         action="store",
         type=str,
-        default="/puppet/end_pose_right",
-        required=False,
-    )
-    parser.add_argument(
-        "--robot_base_topic",
-        action="store",
-        type=str,
-        help="robot_base_topic",
-        default="/odom_raw",
-        required=False,
-    )
-    parser.add_argument(
-        "--robot_base_cmd_topic",
-        action="store",
-        type=str,
-        help="robot_base_topic",
-        default="/cmd_vel",
-        required=False,
-    )
-    parser.add_argument(
-        "--use_robot_base",
-        action="store_true",
-        help="Whether to use the robot base to move around",
-        default=False,
+        default="/puppet/end_pose_euler_right",
         required=False,
     )
     parser.add_argument(
@@ -629,7 +613,7 @@ def get_arguments():
     parser.add_argument(
         "--ctrl_type",
         type=str,
-        choices=["joint", "eef", "ee6d"],
+        choices=["joint", "eef"],
         help="Control type for the robot arm",
         default="joint",
     )
@@ -638,7 +622,7 @@ def get_arguments():
         action="store",
         type=str,
         help="Websocket server host",
-        default="10.0.0.1",
+        default="0.0.0.0",
         required=False,
     )
     parser.add_argument(
@@ -655,35 +639,26 @@ def get_arguments():
         type=str,
         help="Task name",
         required=True,
-        choices=["towel", "rubbish", "tissue", "beverage", "play_pp", "pick_pp", "react"],
     )
     parser.add_argument(
-        "--delay",
-        type=int,
-        help="Delay in steps",
-        default=4,
-        required=False,
-    )
-    parser.add_argument(
-        "--exec_horizon",
-        type=int,
-        help="Execution horizon in steps",
-        default=25,
-        required=False,
-    )
-    parser.add_argument(
-        "--mode",
-        action="store",
+        "--model",
         type=str,
-        choices=["naive", "rtc"],
-        help="Mode of the inference",
-        default="rtc",
+        choices=["openpi"],
+        help="Model to use",
+        default="openpi",
         required=False,
     )
     parser.add_argument(
-        "--streaming",
+        "--save_rollout",
         action="store_true",
-        help="Whether to use streaming inference",
+        help="Save inference rollouts as aloha-style HDF5 episodes",
+        default=False,
+    )
+    parser.add_argument(
+        "--rollout_out_path",
+        type=str,
+        help="Output root for rollout HDF5 files (actual dir = <rollout_out_path>/<task>)",
+        default="data/agilex/rollouts_hdf5",
     )
 
     args = parser.parse_args()
@@ -692,7 +667,7 @@ def get_arguments():
 
 def main():
     args = get_arguments()
-    ros_operator = RosOperator(args)
+    ros_operator = RosOperator(args, mode="inference")
     config = get_config(args)
 
     signal.signal(signal.SIGINT, _on_sigint)

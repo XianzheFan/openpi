@@ -64,9 +64,9 @@ DATASET_FPS = 30
 # Rescue trigger thresholds based on Robometer progress scores
 # Progress score is 0→1 (0 = start, 1 = task complete)
 RESCUE_PROGRESS_ABSOLUTE = 0.25     # rescue if progress stalls below this
-RESCUE_PROGRESS_DROP = 0.05         # rescue if progress drops by this much
-RESCUE_SUCCESS_THRESHOLD = 0.5      # rescue if success probability below this
-RESCUE_PROGRESS_RISING = 0.02       # skip rescue if progress rose by this much recently
+RESCUE_PROGRESS_DROP = 0.04         # rescue if progress drops by this much
+RESCUE_SUCCESS_THRESHOLD = 0.6      # rescue if success probability below this
+RESCUE_PROGRESS_RISING = 0.05       # skip rescue if progress rose by this much recently
 
 CAMERA_NAMES = ["cam_high", "cam_left_wrist", "cam_right_wrist"]
 CAMERA_TO_KEY = {
@@ -166,7 +166,7 @@ def progress_to_switch_labels(
 
     Guardrail on condition 3 only: Robometer's success probability lags behind
     actual progress (stays near 0 until the task is nearly complete). If progress
-    is actively rising (>= RESCUE_PROGRESS_RISING over the lookback window), low
+    rose by >= RESCUE_PROGRESS_RISING within the last 3 per-frame samples, low
     success is not a reliable failure signal — suppress. Conditions 1, 2, 4 are
     real failure signals and are NOT suppressed.
 
@@ -174,16 +174,21 @@ def progress_to_switch_labels(
     """
     T = len(progress)
     records = []
+    COND3_RISING_WINDOW = 3
 
     for frame_i in range(0, T, replan_interval):
         p = float(progress[frame_i])
         s = float(success[frame_i]) if frame_i < len(success) else 0.5
 
-        # Compute progress trend over a short lookback window
+        # Longer lookback (used for condition 2 progress-drop check)
         lookback = max(1, replan_interval * 2)
         prev_idx = max(0, frame_i - lookback)
         prev_p = float(progress[prev_idx]) if prev_idx < len(progress) else p
-        is_rising = (p - prev_p) >= RESCUE_PROGRESS_RISING
+
+        # Short-horizon rising check: last 3 per-frame samples (gates condition 3)
+        recent_idx = max(0, frame_i - COND3_RISING_WINDOW)
+        recent_p = float(progress[recent_idx])
+        is_rising = (p - recent_p) >= RESCUE_PROGRESS_RISING
 
         should_rescue = False
         time_fraction = frame_i / max(T - 1, 1)
@@ -197,7 +202,8 @@ def progress_to_switch_labels(
         if (prev_p - p) >= progress_drop:
             should_rescue = True
 
-        # Condition 3: low success probability — SKIP if progress is rising
+        # Condition 3: low success probability — SKIP if progress rose by
+        # >= RESCUE_PROGRESS_RISING within the last 3 frames
         if s < success_threshold and time_fraction > 0.1 and not is_rising:
             should_rescue = True
 
