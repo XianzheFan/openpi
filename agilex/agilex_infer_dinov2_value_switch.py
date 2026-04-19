@@ -52,6 +52,7 @@ import threading
 import time
 import tty
 
+import cv2
 import imageio
 import numpy as np
 import requests
@@ -499,8 +500,10 @@ def model_inference(args, config, ros_operator):
         sde_policy.warmup(rtc=False, streaming=False)
     print("Servers warmed up")
 
-    output_dir = pathlib.Path(args.video_out_path)
+    run_stamp = time.strftime("%Y%m%d_%H%M%S")
+    output_dir = pathlib.Path(args.video_out_path) / f"run_{run_stamp}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    logging.info(f"Output dir for this run: {output_dir}")
 
     try:
         episode_idx = 0
@@ -546,18 +549,30 @@ def model_inference(args, config, ros_operator):
                         user_stopped = True
                         return
 
-                # Capture current frame for rollout + clip buffer
-                with observation_window_lock:
-                    if observation_window is not None and len(observation_window) > 0:
-                        cur_imgs = observation_window[-1]["images"]
-                        front_img = cur_imgs.get(config["camera_names"][0])
-                        right_img = cur_imgs.get(config["camera_names"][1])
-                        left_img = cur_imgs.get(config["camera_names"][2])
-                        if front_img is not None:
-                            collected_frames.append(np.asarray(front_img).copy())
-                            frame_counter += 1
-                            if clip_buffer is not None:
-                                clip_buffer.update(front_img, right_img, left_img)
+                # Capture current frame for rollout + clip buffer.
+                # Pull straight from ROS camera queues so recording runs at
+                # publish_rate, not at chunk_size cadence.
+                front_msg = (
+                    ros_operator.front_image_queue[-1]
+                    if len(ros_operator.front_image_queue) > 0 else None
+                )
+                if front_msg is not None:
+                    front_img = ros_operator.bridge.imgmsg_to_cv2(front_msg, "passthrough")
+                    collected_frames.append(np.asarray(front_img).copy())
+                    frame_counter += 1
+                    if clip_buffer is not None:
+                        right_msg = (
+                            ros_operator.right_image_queue[-1]
+                            if len(ros_operator.right_image_queue) > 0 else None
+                        )
+                        left_msg = (
+                            ros_operator.left_image_queue[-1]
+                            if len(ros_operator.left_image_queue) > 0 else None
+                        )
+                        if right_msg is not None and left_msg is not None:
+                            right_img = ros_operator.bridge.imgmsg_to_cv2(right_msg, "passthrough")
+                            left_img = ros_operator.bridge.imgmsg_to_cv2(left_msg, "passthrough")
+                            clip_buffer.update(front_img, right_img, left_img)
 
                 # Replan at every chunk boundary
                 if t % chunk_size == 0:
@@ -648,15 +663,23 @@ def model_inference(args, config, ros_operator):
                 rate.sleep()
 
             suffix = "stopped" if user_stopped else "done"
-            final_dir = output_dir / f"rollout_{task_segment}_ep{episode_idx}_{suffix}"
-            rollout_dir.rename(final_dir)
+            base_name = f"rollout_{task_segment}_ep{episode_idx}_{suffix}"
+            final_dir = output_dir / base_name
+            dedup_idx = 1
+            while final_dir.exists():
+                final_dir = output_dir / f"{base_name}_{dedup_idx}"
+                dedup_idx += 1
+            shutil.move(str(rollout_dir), str(final_dir))
 
             _write_results(final_dir, task_description, suffix, switch_log, value_selections)
 
             if collected_frames:
+                annotated = _annotate_rescue_frames(
+                    collected_frames, switch_log, window=chunk_size,
+                )
                 imageio.mimwrite(
                     str(final_dir / "complete_video.mp4"),
-                    [np.asarray(x) for x in collected_frames],
+                    annotated,
                     fps=ROLLOUT_FPS,
                 )
 
@@ -667,6 +690,40 @@ def model_inference(args, config, ros_operator):
 
     finally:
         ros_operator.puppet_arm_publish_continuous(left0, right0)
+
+
+def _annotate_rescue_frames(frames: list, switch_log: list, window: int) -> list:
+    """Return a copy of ``frames`` with a RESCUE banner drawn during switch windows.
+
+    Each entry in ``switch_log`` has a 1-based ``frame`` index (== ``frame_counter``
+    at trigger time). The banner persists for ``window`` frames (== chunk_size,
+    the SDE-action injection horizon), or until the next switch trigger.
+    """
+    if not switch_log:
+        return [np.asarray(f) for f in frames]
+
+    events = sorted(switch_log, key=lambda e: int(e["frame"]))
+    out = []
+    ev_idx = 0
+    active_until = -1
+    active_prob = 0.0
+    for i, frm in enumerate(frames):
+        frame_no = i + 1
+        while ev_idx < len(events) and int(events[ev_idx]["frame"]) <= frame_no:
+            active_until = int(events[ev_idx]["frame"]) + window - 1
+            active_prob = float(events[ev_idx]["switch_prob"])
+            ev_idx += 1
+        img = np.ascontiguousarray(np.asarray(frm))
+        if frame_no <= active_until:
+            h, w = img.shape[:2]
+            cv2.rectangle(img, (0, 0), (w - 1, h - 1), (0, 0, 255), 4)
+            txt = f"RESCUE p={active_prob:.2f}"
+            cv2.putText(img, txt, (12, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                        (0, 0, 0), 5, cv2.LINE_AA)
+            cv2.putText(img, txt, (12, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                        (0, 0, 255), 2, cv2.LINE_AA)
+        out.append(img)
+    return out
 
 
 def _write_results(rollout_dir: pathlib.Path, task_description: str, suffix: str,
