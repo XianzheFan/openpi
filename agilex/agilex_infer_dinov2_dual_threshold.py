@@ -51,6 +51,7 @@ Usage
 
 import argparse
 import collections
+import concurrent.futures
 import json
 import logging
 import os
@@ -76,7 +77,7 @@ from agilex_infer_dinov2_value_switch import (
     ROLLOUT_FPS,
     SwitchClipBuffer,
     ValueExpertScorer,
-    _select_best_action_with_value_expert,
+    _dreamdojo_generate,
 )
 
 
@@ -155,12 +156,14 @@ class RescueThresholdChecker:
         success_threshold: float = 0.6,
         progress_rising: float = 0.05,
         expected_progress_rate: float = 0.0,
+        completion_guard: float = 1.01,
     ):
         self.progress_threshold = progress_threshold
         self.progress_drop = progress_drop
         self.success_threshold = success_threshold
         self.progress_rising = progress_rising
         self.expected_progress_rate = expected_progress_rate
+        self.completion_guard = completion_guard
         self.history: list[tuple[float, float, float]] = []
 
     def reset(self):
@@ -178,6 +181,25 @@ class RescueThresholdChecker:
         is_rising = (p - recent_p) >= self.progress_rising
 
         adaptive_threshold = self.progress_threshold + time_fraction * 0.3
+        info = {
+            "progress": p,
+            "success": s,
+            "time_fraction": time_fraction,
+            "prev_p_2s": prev_p,
+            "recent_p_1s": recent_p,
+            "is_rising": is_rising,
+            "adaptive_threshold": adaptive_threshold,
+            "completion_guard": self.completion_guard,
+        }
+
+        # Completion guard: if the model thinks the task is basically finished,
+        # skip all rescue conditions. This prevents end-of-episode false
+        # triggers where the head's prediction noise causes cond2/cond3 to
+        # fire after the task is already done.
+        if max(p, s) >= self.completion_guard:
+            info["completion_guarded"] = True
+            return False, [], info
+
         reasons: list[str] = []
 
         if p < adaptive_threshold and time_fraction > 0.15:
@@ -194,15 +216,6 @@ class RescueThresholdChecker:
             if p < expected_p * 0.5 and time_fraction > 0.3:
                 reasons.append("cond4_behind_expected")
 
-        info = {
-            "progress": p,
-            "success": s,
-            "time_fraction": time_fraction,
-            "prev_p_2s": prev_p,
-            "recent_p_1s": recent_p,
-            "is_rising": is_rising,
-            "adaptive_threshold": adaptive_threshold,
-        }
         return bool(reasons), reasons, info
 
 
@@ -297,6 +310,137 @@ def inference_fn_sync(args, config, policy, ros_operator):
     elapsed = (time.perf_counter() - start_time) * 1000
     print(f"[Sync] Model inference: {elapsed:.1f}ms")
     return np.asarray(actions)
+
+
+def _select_best_action_with_prefix(
+    obs_snapshot: dict,
+    sde_policy: "OpenpiClient",
+    value_scorer: ValueExpertScorer,
+    exec_horizon: int,
+    task_description: str,
+    step_save_dir: pathlib.Path,
+    dd_host: str,
+    dd_base_port: int,
+    num_samples: int,
+    prefix_action: "np.ndarray | None",
+    skip_steps: int,
+) -> tuple[np.ndarray, dict]:
+    """Same pipeline as ``_select_best_action_with_value_expert`` but with a
+    consistent "hold prefix" modification: the first ``skip_steps`` actions of
+    every sampled SDE chunk are replaced with ``prefix_action`` before the chunk
+    is sent to DreamDojo AND before it is returned for execution. This keeps
+    value-expert scoring and on-robot execution aligned, and avoids the
+    "rescue first swings home" behavior of the raw SDE chunk head.
+
+    When ``skip_steps == 0`` or ``prefix_action`` is None, this degenerates to
+    the original behavior.
+    """
+    step_save_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_chunks = [np.asarray(sde_policy.predict_action(obs_snapshot)) for _ in range(num_samples)]
+
+    skip = int(max(0, skip_steps))
+    action_chunks: list[np.ndarray] = []
+    for ch in raw_chunks:
+        ch = np.array(ch, copy=True)
+        if prefix_action is not None and skip > 0:
+            k = min(skip, ch.shape[0])
+            ch[:k] = np.asarray(prefix_action, dtype=ch.dtype)
+        action_chunks.append(ch)
+
+    frame_img = obs_snapshot["top"]
+    save_prefix = step_save_dir.name
+    tasks = [
+        {
+            "host": dd_host,
+            "port": dd_base_port + i,
+            "actions": np.asarray(action_chunks[i][:exec_horizon], dtype=np.float32),
+            "save_name": f"{save_prefix}/chunk_{i}",
+        }
+        for i in range(num_samples)
+    ]
+
+    logging.info(
+        f"[Dual] Launching {num_samples} DreamDojo gens "
+        f"(prefix_skip={skip}, horizon={exec_horizon})..."
+    )
+
+    def _submit(task):
+        return _dreamdojo_generate(
+            task["host"], task["port"], frame_img,
+            task["actions"], task["save_name"], task_description,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, num_samples)) as ex:
+        futures = {ex.submit(_submit, t): i for i, t in enumerate(tasks)}
+        save_paths: dict[int, str] = {}
+        for fut in concurrent.futures.as_completed(futures):
+            idx = futures[fut]
+            save_paths[idx] = fut.result()
+
+    valid = [
+        (i, save_paths[i]) for i in range(num_samples)
+        if save_paths.get(i) and os.path.exists(save_paths[i])
+    ]
+
+    if not valid:
+        logging.warning("[Dual] All DreamDojo generations failed; using chunk 0.")
+        return np.asarray(action_chunks[0][:exec_horizon]), {
+            "num_candidates": 0,
+            "candidate_scores": {},
+            "best_idx": 0,
+            "prefix_skip_steps": skip,
+            "error": "All DreamDojo generations failed",
+        }
+
+    local_valid: list[tuple[int, str]] = []
+    for orig_i, orig_path in valid:
+        dst = step_save_dir / f"output_{orig_i}.mp4"
+        try:
+            shutil.copy2(orig_path, dst)
+            local_valid.append((orig_i, str(dst)))
+        except Exception as e:
+            logging.warning(f"[Dual] Could not copy {orig_path} -> {dst}: {e}")
+            local_valid.append((orig_i, orig_path))
+
+    candidate_scores: dict[int, float] = {}
+    per_window_details: dict[int, list] = {}
+    for orig_i, video_path in local_valid:
+        try:
+            frames = imageio.mimread(video_path)
+            frames = [np.asarray(f) for f in frames]
+        except Exception as e:
+            logging.error(f"[ValueExpert] Failed to read {video_path}: {e}")
+            continue
+        per_window = value_scorer.score_video(video_frames=frames)
+        agg_score = value_scorer.aggregate_video_score(per_window)
+        candidate_scores[orig_i] = float(agg_score)
+        per_window_details[orig_i] = per_window.tolist()
+        logging.info(
+            f"[ValueExpert] Candidate {orig_i}: agg={agg_score:.4f} "
+            f"(windows={len(per_window)}, min={per_window.min():.4f})"
+        )
+
+    if not candidate_scores:
+        logging.warning("[Dual] All video scoring failed; using first valid chunk.")
+        best_idx = local_valid[0][0]
+    else:
+        best_idx = min(candidate_scores, key=candidate_scores.get)
+
+    selection_record = {
+        "num_candidates": len(local_valid),
+        "candidate_scores": {str(k): v for k, v in candidate_scores.items()},
+        "per_window_details": {str(k): v for k, v in per_window_details.items()},
+        "best_idx": int(best_idx),
+        "best_score": candidate_scores.get(best_idx, float("inf")),
+        "prefix_skip_steps": skip,
+    }
+    logging.info(
+        f"[Dual] Selected candidate {best_idx} "
+        f"(score={candidate_scores.get(best_idx, 'N/A')}, prefix_skip={skip})"
+    )
+
+    return np.asarray(action_chunks[best_idx][:exec_horizon]), selection_record
 
 
 def model_inference(args, config, ros_operator):
@@ -409,6 +553,7 @@ def model_inference(args, config, ros_operator):
                 success_threshold=args.success_threshold,
                 progress_rising=args.progress_rising,
                 expected_progress_rate=args.expected_progress_rate,
+                completion_guard=args.rescue_completion_guard,
             )
 
             task_segment = task_description.replace(" ", "_")
@@ -420,6 +565,12 @@ def model_inference(args, config, ros_operator):
             last_rescue_check_t = -rescue_check_stride
             last_rescue_trigger_t = -10 ** 9
             last_published_action: np.ndarray | None = None
+            latest_dual_progress: float = 0.0
+            latest_dual_success: float = 0.0
+            latest_dual_reasons: list = []
+            latest_dual_tf: float = 0.0
+            latest_dual_valid: bool = False
+            rescue_active_until_frame: int = -1
             user_stopped = False
             t = 0
 
@@ -442,8 +593,25 @@ def model_inference(args, config, ros_operator):
                 )
                 if front_msg is not None:
                     front_img = ros_operator.bridge.imgmsg_to_cv2(front_msg, "passthrough")
-                    collected_frames.append(np.asarray(front_img).copy())
                     frame_counter += 1
+                    rescue_active_now = frame_counter <= rescue_active_until_frame
+                    hud_frame = np.ascontiguousarray(np.asarray(front_img).copy())
+                    if latest_dual_valid:
+                        _draw_dualhead_hud(
+                            hud_frame,
+                            latest_dual_progress,
+                            latest_dual_success,
+                            latest_dual_tf,
+                            latest_dual_reasons,
+                            rescue_active_now,
+                        )
+                    if args.show_live_window:
+                        try:
+                            cv2.imshow("dualhead", hud_frame[..., ::-1])
+                            cv2.waitKey(1)
+                        except Exception as e:
+                            logging.warning(f"[HUD] cv2.imshow failed: {e}")
+                    collected_frames.append(hud_frame)
                     if clip_buffer is not None:
                         right_msg = (
                             ros_operator.right_image_queue[-1]
@@ -508,6 +676,12 @@ def model_inference(args, config, ros_operator):
                         "adaptive_threshold": info["adaptive_threshold"],
                     })
 
+                    latest_dual_progress = float(progress_p)
+                    latest_dual_success = float(success_p)
+                    latest_dual_tf = float(time_fraction)
+                    latest_dual_reasons = list(reasons)
+                    latest_dual_valid = True
+
                     logging.info(
                         f"[DualHead t={t:4d} f={frame_counter:4d}] "
                         f"p={progress_p:.3f} s={success_p:.3f} "
@@ -519,8 +693,9 @@ def model_inference(args, config, ros_operator):
                     )
 
                     if triggered:
+                        rescue_active_until_frame = frame_counter + chunk_size - 1
                         step_save_dir = rollout_dir / "rescue_steps" / f"t{t}_f{frame_counter}"
-                        best_actions, sel_record = _select_best_action_with_value_expert(
+                        best_actions, sel_record = _select_best_action_with_prefix(
                             obs_snapshot=obs_snapshot,
                             sde_policy=sde_policy,
                             value_scorer=value_scorer,
@@ -530,6 +705,8 @@ def model_inference(args, config, ros_operator):
                             dd_host=args.dd_host,
                             dd_base_port=args.dd_base_port,
                             num_samples=args.num_sde_samples,
+                            prefix_action=last_published_action,
+                            skip_steps=args.rescue_skip_sde_steps,
                         )
                         sel_record["t"] = t
                         sel_record["frame"] = frame_counter
@@ -624,6 +801,43 @@ def model_inference(args, config, ros_operator):
 
     finally:
         ros_operator.puppet_arm_publish_continuous(left0, right0)
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
+
+
+def _draw_dualhead_hud(
+    img: np.ndarray,
+    progress: float,
+    success: float,
+    time_fraction: float,
+    reasons: list,
+    rescue_active: bool,
+) -> np.ndarray:
+    """Draw a persistent bottom-left HUD with the latest dual-head scores.
+
+    Modifies ``img`` in place and returns it.
+    """
+    h, _w = img.shape[:2]
+    main_color = (0, 0, 255) if rescue_active else (0, 220, 0)
+    main_txt = f"p={progress:.2f}  s={success:.2f}  tf={time_fraction:.2f}"
+    y = h - 16
+    cv2.putText(img, main_txt, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                (0, 0, 0), 4, cv2.LINE_AA)
+    cv2.putText(img, main_txt, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                main_color, 2, cv2.LINE_AA)
+    sub = ""
+    if rescue_active:
+        sub = "RESCUE"
+        if reasons:
+            sub += ": " + ",".join(reasons)
+    if sub:
+        cv2.putText(img, sub, (12, y - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(img, sub, (12, y - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    main_color, 1, cv2.LINE_AA)
+    return img
 
 
 def _annotate_rescue_frames(frames: list, rescue_log: list, window: int) -> list:
@@ -774,6 +988,16 @@ def get_arguments():
                         help="Linearly blend the first K SDE actions toward the "
                              "last published action so the injection is C0 "
                              "continuous. 0 disables blending.")
+    parser.add_argument("--rescue_skip_sde_steps", type=int, default=0,
+                        help="Hold the last published action for the first N "
+                             "steps of every SDE candidate chunk (both for "
+                             "DreamDojo scoring and for execution) to suppress "
+                             "the 'rescue swings home first' artifact. 0 keeps "
+                             "the raw SDE chunk head.")
+    parser.add_argument("--show_live_window", action="store_true", default=False,
+                        help="Open a cv2 window that shows the rollout frame "
+                             "with the latest dual-head p/s scores overlaid "
+                             "in real time. Requires a display ($DISPLAY).")
     parser.add_argument("--progress_threshold", type=float, default=0.25,
                         help="Base progress threshold; adaptive = base + tf × 0.3")
     parser.add_argument("--progress_drop", type=float, default=0.04,
@@ -784,6 +1008,12 @@ def get_arguments():
                         help="Suppress cond-3 if progress rose ≥ this vs. 1s-ago tick")
     parser.add_argument("--expected_progress_rate", type=float, default=0.0,
                         help="If > 0, enable cond-4 (below expected linear trajectory)")
+    parser.add_argument("--rescue_completion_guard", type=float, default=0.85,
+                        help="If max(progress, success) >= this value at check "
+                             "time, suppress all rescue conditions. Prevents "
+                             "end-of-episode false triggers once the head "
+                             "thinks the task is basically done. Set to 1.01 "
+                             "to disable the guard.")
     # ---- DreamDojo ----
     parser.add_argument("--dd_host", type=str, default="127.0.0.1")
     parser.add_argument("--dd_base_port", type=int, default=8020)
