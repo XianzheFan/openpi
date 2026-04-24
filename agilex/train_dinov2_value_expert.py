@@ -716,6 +716,8 @@ def train(args):
     criterion = nn.MSELoss()
 
     output_dir = pathlib.Path(args.output_dir)
+    if args.wandb_run_name:
+        output_dir = output_dir / args.wandb_run_name
     if is_main:
         output_dir.mkdir(parents=True, exist_ok=True)
     if distributed:

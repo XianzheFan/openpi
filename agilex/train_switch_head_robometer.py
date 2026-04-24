@@ -1001,8 +1001,10 @@ def main():
     p_train.add_argument("--val_ratio", type=float, default=0.0,
                          help="Hold out this fraction of rollouts as val if --val_dir not set")
     p_train.add_argument("--val_split_seed", type=int, default=42)
-    p_train.add_argument("--output_dir", type=str,
-                         default="checkpoints/switch_head_robometer")
+    p_train.add_argument("--output_dir", type=str, default=None,
+                         help="Checkpoint dir. If unset, defaults to "
+                              "checkpoints/switch_head_robometer/<run_tag>, where run_tag is "
+                              "--wandb_run_name or the basename of --data_dir.")
     p_train.add_argument(
         "--dinov2_model", type=str, default="dinov2_vitb14",
         choices=["dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"],
@@ -1034,6 +1036,9 @@ def main():
     if args.command == "pack":
         pack(args)
     elif args.command == "train":
+        if args.output_dir is None:
+            run_tag = args.wandb_run_name or pathlib.Path(args.data_dir).name
+            args.output_dir = str(pathlib.Path("checkpoints/switch_head_robometer") / run_tag)
         train(args)
 
 

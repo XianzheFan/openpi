@@ -69,6 +69,11 @@ import imageio
 import numpy as np
 import torch
 
+try:
+    import h5py
+except Exception:
+    h5py = None
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from clients import OpenpiClient
 from agilex_utils import check_keyboard_input, get_config, handle_interactive_mode, process_action
@@ -315,6 +320,7 @@ def inference_fn_sync(args, config, policy, ros_operator):
 def _select_best_action_with_prefix(
     obs_snapshot: dict,
     sde_policy: "OpenpiClient",
+    value_scorer: ValueExpertScorer,
     exec_horizon: int,
     task_description: str,
     step_save_dir: pathlib.Path,
@@ -324,12 +330,20 @@ def _select_best_action_with_prefix(
     prefix_action: "np.ndarray | None",
     skip_steps: int,
 ) -> tuple[np.ndarray, dict]:
-    """Sends action candidates to DreamDojo server, which generates the video 
-    AND scores it in-memory, returning the score over the network.
+    """Same pipeline as ``_select_best_action_with_value_expert`` but with a
+    consistent "hold prefix" modification: the first ``skip_steps`` actions of
+    every sampled SDE chunk are replaced with ``prefix_action`` before the chunk
+    is sent to DreamDojo AND before it is returned for execution. This keeps
+    value-expert scoring and on-robot execution aligned, and avoids the
+    "rescue first swings home" behavior of the raw SDE chunk head.
+
+    When ``skip_steps == 0`` or ``prefix_action`` is None, this degenerates to
+    the original behavior.
     """
     step_save_dir.mkdir(parents=True, exist_ok=True)
 
     raw_chunks = [np.asarray(sde_policy.predict_action(obs_snapshot)) for _ in range(num_samples)]
+
     skip = int(max(0, skip_steps))
     action_chunks: list[np.ndarray] = []
     for ch in raw_chunks:
@@ -340,19 +354,19 @@ def _select_best_action_with_prefix(
         action_chunks.append(ch)
 
     frame_img = obs_snapshot["top"]
-    save_prefix = str(step_save_dir.absolute())
+    save_prefix = step_save_dir.name
     tasks = [
         {
             "host": dd_host,
             "port": dd_base_port + i,
             "actions": np.asarray(action_chunks[i][:exec_horizon], dtype=np.float32),
             "save_name": f"{save_prefix}/chunk_{i}",
-        } # 强制使用绝对路径，确保服务端能存到你这里
+        }
         for i in range(num_samples)
     ]
 
     logging.info(
-        f"[Dual] Launching {num_samples} DreamDojo gens+scores "
+        f"[Dual] Launching {num_samples} DreamDojo gens "
         f"(prefix_skip={skip}, horizon={exec_horizon})..."
     )
 
@@ -364,45 +378,64 @@ def _select_best_action_with_prefix(
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, num_samples)) as ex:
         futures = {ex.submit(_submit, t): i for i, t in enumerate(tasks)}
-        results_dict: dict[int, dict] = {}
+        save_paths: dict[int, str] = {}
         for fut in concurrent.futures.as_completed(futures):
             idx = futures[fut]
-            try:
-                results_dict[idx] = fut.result()
-            except Exception as e:
-                logging.error(f"[Dual] Request {idx} failed: {e}")
-                results_dict[idx] = None
+            save_paths[idx] = fut.result()
+
+    valid = [
+        (i, save_paths[i]) for i in range(num_samples)
+        if save_paths.get(i) and os.path.exists(save_paths[i])
+    ]
+
+    if not valid:
+        logging.warning("[Dual] All DreamDojo generations failed; using chunk 0.")
+        return np.asarray(action_chunks[0][:exec_horizon]), {
+            "num_candidates": 0,
+            "candidate_scores": {},
+            "best_idx": 0,
+            "prefix_skip_steps": skip,
+            "error": "All DreamDojo generations failed",
+        }
+
+    local_valid: list[tuple[int, str]] = []
+    for orig_i, orig_path in valid:
+        dst = step_save_dir / f"output_{orig_i}.mp4"
+        try:
+            shutil.copy2(orig_path, dst)
+            local_valid.append((orig_i, str(dst)))
+        except Exception as e:
+            logging.warning(f"[Dual] Could not copy {orig_path} -> {dst}: {e}")
+            local_valid.append((orig_i, orig_path))
 
     candidate_scores: dict[int, float] = {}
-    local_valid: list[tuple[int, str]] = []
-
-    for orig_i in range(num_samples):
-        res = results_dict.get(orig_i)
-        if res and res.get("score") is not None:
-            score = float(res["score"])
-            candidate_scores[orig_i] = score
-            logging.info(f"[ServerScore] Candidate {orig_i} evaluated by server: score={score:.4f}")
-            orig_path = res.get("save_path")
-            if orig_path and os.path.exists(orig_path):
-                dst = step_save_dir / f"output_{orig_i}.mp4"
-                try:
-                    shutil.copy2(orig_path, dst)
-                    local_valid.append((orig_i, str(dst)))
-                except Exception as e:
-                    logging.warning(f"[Dual] Could not copy {orig_path} -> {dst}: {e}")
-                    local_valid.append((orig_i, orig_path))
-        else:
-            logging.warning(f"[Dual] Candidate {orig_i} failed or returned no score.")
+    per_window_details: dict[int, list] = {}
+    for orig_i, video_path in local_valid:
+        try:
+            frames = imageio.mimread(video_path)
+            frames = [np.asarray(f) for f in frames]
+        except Exception as e:
+            logging.error(f"[ValueExpert] Failed to read {video_path}: {e}")
+            continue
+        per_window = value_scorer.score_video(video_frames=frames)
+        agg_score = value_scorer.aggregate_video_score(per_window)
+        candidate_scores[orig_i] = float(agg_score)
+        per_window_details[orig_i] = per_window.tolist()
+        logging.info(
+            f"[ValueExpert] Candidate {orig_i}: agg={agg_score:.4f} "
+            f"(windows={len(per_window)}, min={per_window.min():.4f})"
+        )
 
     if not candidate_scores:
-        logging.warning("[Dual] All video generations/scoring failed; using chunk 0.")
-        best_idx = 0
+        logging.warning("[Dual] All video scoring failed; using first valid chunk.")
+        best_idx = local_valid[0][0]
     else:
         best_idx = min(candidate_scores, key=candidate_scores.get)
 
     selection_record = {
-        "num_candidates": len(candidate_scores),
+        "num_candidates": len(local_valid),
         "candidate_scores": {str(k): v for k, v in candidate_scores.items()},
+        "per_window_details": {str(k): v for k, v in per_window_details.items()},
         "best_idx": int(best_idx),
         "best_score": candidate_scores.get(best_idx, float("inf")),
         "prefix_skip_steps": skip,
@@ -513,6 +546,14 @@ def model_inference(args, config, ros_operator):
             value_selections: list = []
             collected_frames: list = []
             frame_counter = 0
+            rollout_top_frames: list = []
+            rollout_right_frames: list = []
+            rollout_left_frames: list = []
+            rollout_qpos: list = []
+            rollout_eef_pose: list = []
+            rollout_actions: list = []
+            rollout_is_rescue_step: list = []
+            rollout_step_index: list = []
 
             clip_buffer = (
                 SwitchClipBuffer(args.dual_head_clip_len)
@@ -547,7 +588,6 @@ def model_inference(args, config, ros_operator):
             t = 0
 
             while t < max_publish_step and not rospy.is_shutdown() and not shutdown_event.is_set():
-                manual_rescue_pressed = False
                 key = check_keyboard_input()
                 if key == " ":
                     result = handle_interactive_mode(task_time)
@@ -558,11 +598,16 @@ def model_inference(args, config, ros_operator):
                     elif result == "quit":
                         user_stopped = True
                         return
-                elif key == "s":
-                    manual_rescue_pressed = True
-                    print("\n\033[93m>>> [System] Key 's' detected! Manually triggering SDE + DreamDojo rescue mechanism!\033[0m", flush=True)
 
                 # Capture current frame for rollout video + clip buffer.
+                right_msg = (
+                    ros_operator.right_image_queue[-1]
+                    if len(ros_operator.right_image_queue) > 0 else None
+                )
+                left_msg = (
+                    ros_operator.left_image_queue[-1]
+                    if len(ros_operator.left_image_queue) > 0 else None
+                )
                 front_msg = (
                     ros_operator.front_image_queue[-1]
                     if len(ros_operator.front_image_queue) > 0 else None
@@ -588,33 +633,20 @@ def model_inference(args, config, ros_operator):
                         except Exception as e:
                             logging.warning(f"[HUD] cv2.imshow failed: {e}")
                     collected_frames.append(hud_frame)
-                    if clip_buffer is not None:
-                        right_msg = (
-                            ros_operator.right_image_queue[-1]
-                            if len(ros_operator.right_image_queue) > 0 else None
-                        )
-                        left_msg = (
-                            ros_operator.left_image_queue[-1]
-                            if len(ros_operator.left_image_queue) > 0 else None
-                        )
-                        if right_msg is not None and left_msg is not None:
-                            right_img = ros_operator.bridge.imgmsg_to_cv2(right_msg, "passthrough")
-                            left_img = ros_operator.bridge.imgmsg_to_cv2(left_msg, "passthrough")
-                            clip_buffer.update(front_img, right_img, left_img)
+                    if clip_buffer is not None and right_msg is not None and left_msg is not None:
+                        right_img = ros_operator.bridge.imgmsg_to_cv2(right_msg, "passthrough")
+                        left_img = ros_operator.bridge.imgmsg_to_cv2(left_msg, "passthrough")
+                        clip_buffer.update(front_img, right_img, left_img)
 
                 # ----- Rescue check at fixed interval (independent of chunk boundary) -----
                 rescue_triggered = False
-                should_check_auto = (
+                if (
                     can_switch
                     and frame_counter > 0
                     and (t - last_rescue_check_t) >= rescue_check_stride
                     and (t - last_rescue_trigger_t) >= rescue_cooldown_steps
-                )
-
-                if can_switch and (should_check_auto or manual_rescue_pressed):
-                    if should_check_auto:
-                        last_rescue_check_t = t
-
+                ):
+                    last_rescue_check_t = t
                     update_observation_window(args, config, ros_operator)
                     obs_snapshot = _get_obs_snapshot(args, config)
 
@@ -639,14 +671,9 @@ def model_inference(args, config, ros_operator):
                         )
 
                     time_fraction = t / max(max_publish_step - 1, 1)
-                    auto_triggered, reasons, info = checker.add_and_check(
+                    triggered, reasons, info = checker.add_and_check(
                         progress_p, success_p, time_fraction,
                     )
-
-                    triggered = auto_triggered or manual_rescue_pressed
-                    if manual_rescue_pressed:
-                        reasons.append("manual_keyboard_override")
-
                     dual_head_log.append({
                         "t": t,
                         "frame": frame_counter,
@@ -680,15 +707,10 @@ def model_inference(args, config, ros_operator):
                     if triggered:
                         rescue_active_until_frame = frame_counter + chunk_size - 1
                         step_save_dir = rollout_dir / "rescue_steps" / f"t{t}_f{frame_counter}"
-
-                        reasons_str = ",".join(reasons)
-                        print(f"\n\033[93m>>> [System] Rescue Triggered (Progress: {progress_p:.3f}, Success: {success_p:.3f})!\033[0m", flush=True)
-                        print(f"\033[93m>>> [System] Reasons: {reasons_str}\033[0m", flush=True)
-                        print(f"\033[93m>>> [System] Waiting for DreamDojo to generate {args.num_sde_samples} candidate videos and Value Expert to score them. Please wait... <<<\033[0m\n", flush=True)
-
                         best_actions, sel_record = _select_best_action_with_prefix(
                             obs_snapshot=obs_snapshot,
                             sde_policy=sde_policy,
+                            value_scorer=value_scorer,
                             exec_horizon=chunk_size,
                             task_description=task_description,
                             step_save_dir=step_save_dir,
@@ -698,15 +720,6 @@ def model_inference(args, config, ros_operator):
                             prefix_action=last_published_action,
                             skip_steps=args.rescue_skip_sde_steps,
                         )
-
-                        best_score = sel_record.get('best_score', 'N/A')
-                        if isinstance(best_score, float):
-                            best_score_str = f"{best_score:.4f}"
-                        else:
-                            best_score_str = str(best_score)
-                        print(f"\n\033[92m>>> [System] Evaluation complete! Selected optimal action sequence (Candidate ID: {sel_record.get('best_idx')}, Score: {best_score_str})\033[0m", flush=True)
-                        print(f"\033[92m>>> [System] Injecting actions into buffer. Robot resuming execution! <<<\033[0m\n", flush=True)
-                        
                         sel_record["t"] = t
                         sel_record["frame"] = frame_counter
                         sel_record["progress"] = progress_p
@@ -765,6 +778,44 @@ def model_inference(args, config, ros_operator):
                     ros_operator.puppet_arm_pose_publish(left_action, right_action)
                 last_published_action = np.asarray(act).copy()
 
+                if args.save_rollout:
+                    top_np = None
+                    right_np = None
+                    left_np = None
+                    if front_msg is not None:
+                        top_np = np.ascontiguousarray(np.asarray(ros_operator.bridge.imgmsg_to_cv2(front_msg, "passthrough"))).copy()
+                    if right_msg is not None:
+                        right_np = np.ascontiguousarray(np.asarray(ros_operator.bridge.imgmsg_to_cv2(right_msg, "passthrough"))).copy()
+                    if left_msg is not None:
+                        left_np = np.ascontiguousarray(np.asarray(ros_operator.bridge.imgmsg_to_cv2(left_msg, "passthrough"))).copy()
+
+                    cur_qpos = None
+                    cur_eef_pose = None
+                    with observation_window_lock:
+                        if observation_window is not None and len(observation_window) > 0:
+                            cur_qpos = observation_window[-1].get("qpos")
+                            cur_eef_pose = observation_window[-1].get("eef_pose")
+
+                    if cur_qpos is None:
+                        cur_qpos = np.zeros(14, dtype=np.float32)
+                    if cur_eef_pose is None:
+                        cur_eef_pose = np.zeros(14, dtype=np.float32)
+                    if top_np is None:
+                        top_np = np.zeros((1, 1, 3), dtype=np.uint8)
+                    if right_np is None:
+                        right_np = np.zeros_like(top_np)
+                    if left_np is None:
+                        left_np = np.zeros_like(top_np)
+
+                    rollout_top_frames.append(top_np)
+                    rollout_right_frames.append(right_np)
+                    rollout_left_frames.append(left_np)
+                    rollout_qpos.append(np.asarray(cur_qpos, dtype=np.float32).copy())
+                    rollout_eef_pose.append(np.asarray(cur_eef_pose, dtype=np.float32).copy())
+                    rollout_actions.append(np.asarray(act, dtype=np.float32).copy())
+                    rollout_is_rescue_step.append(1 if frame_counter <= rescue_active_until_frame else 0)
+                    rollout_step_index.append(int(t))
+
                 t += 1
                 print(f"[Step {t:4d}] Published  (buf_idx={idx_in_chunk}/{chunk_size})")
                 rate.sleep()
@@ -793,6 +844,30 @@ def model_inference(args, config, ros_operator):
                     fps=ROLLOUT_FPS,
                 )
 
+            if args.save_rollout:
+                rollout_root = pathlib.Path(args.rollout_out_path)
+                rollout_root.mkdir(parents=True, exist_ok=True)
+                rollout_h5_path = rollout_root / f"rollout_{task_segment}_ep{episode_idx}_{suffix}.hdf5"
+                dedup_idx = 1
+                while rollout_h5_path.exists():
+                    rollout_h5_path = rollout_root / f"rollout_{task_segment}_ep{episode_idx}_{suffix}_{dedup_idx}.hdf5"
+                    dedup_idx += 1
+                _write_rollout_hdf5(
+                    save_path=rollout_h5_path,
+                    task_description=task_description,
+                    outcome=suffix,
+                    ctrl_type=args.ctrl_type,
+                    publish_rate=args.publish_rate,
+                    image_top=rollout_top_frames,
+                    image_right=rollout_right_frames,
+                    image_left=rollout_left_frames,
+                    qpos=rollout_qpos,
+                    eef_pose=rollout_eef_pose,
+                    actions=rollout_actions,
+                    is_rescue_step=rollout_is_rescue_step,
+                    step_index=rollout_step_index,
+                )
+
             logging.info(f"Episode {episode_idx} finished: {suffix}")
             logging.info(f"Rescue activations: {len(rescue_log)}")
             episode_idx += 1
@@ -819,16 +894,7 @@ def _draw_dualhead_hud(
     Modifies ``img`` in place and returns it.
     """
     h, _w = img.shape[:2]
-
-    is_manual = rescue_active and ("manual_keyboard_override" in reasons)
-
-    if is_manual:
-        main_color = (0, 165, 255)
-    elif rescue_active:
-        main_color = (0, 0, 255)
-    else:
-        main_color = (0, 220, 0)
-
+    main_color = (0, 0, 255) if rescue_active else (0, 220, 0)
     main_txt = f"p={progress:.2f}  s={success:.2f}  tf={time_fraction:.2f}"
     y = h - 16
     cv2.putText(img, main_txt, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
@@ -837,11 +903,9 @@ def _draw_dualhead_hud(
                 main_color, 2, cv2.LINE_AA)
     sub = ""
     if rescue_active:
-        sub = "MANUAL OVERRIDE" if is_manual else "RESCUE"
-        display_reasons = [r for r in reasons if r != "manual_keyboard_override"]
-        if display_reasons:
-            sub += ": " + ",".join(display_reasons)
-
+        sub = "RESCUE"
+        if reasons:
+            sub += ": " + ",".join(reasons)
     if sub:
         cv2.putText(img, sub, (12, y - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                     (0, 0, 0), 3, cv2.LINE_AA)
@@ -876,30 +940,21 @@ def _annotate_rescue_frames(frames: list, rescue_log: list, window: int) -> list
             active_s = float(events[ev_idx].get("success", 0.0))
             active_reasons = list(events[ev_idx].get("reasons", []))
             ev_idx += 1
-
         img = np.ascontiguousarray(np.asarray(frm))
         if frame_no <= active_until:
             h, w = img.shape[:2]
-
-            is_manual = "manual_keyboard_override" in active_reasons
-            color = (0, 165, 255) if is_manual else (0, 0, 255)
-            prefix = "MANUAL OVERRIDE" if is_manual else "RESCUE"
-
-            cv2.rectangle(img, (0, 0), (w - 1, h - 1), color, 4)
-
-            txt = f"{prefix} p={active_p:.2f} s={active_s:.2f}"
+            cv2.rectangle(img, (0, 0), (w - 1, h - 1), (0, 0, 255), 4)
+            txt = f"RESCUE p={active_p:.2f} s={active_s:.2f}"
             cv2.putText(img, txt, (12, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                         (0, 0, 0), 5, cv2.LINE_AA)
             cv2.putText(img, txt, (12, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-                        color, 2, cv2.LINE_AA)
-
+                        (0, 0, 255), 2, cv2.LINE_AA)
             if active_reasons:
-                display_reasons = [r for r in active_reasons if r != "manual_keyboard_override"]
-                sub = ",".join(display_reasons) if display_reasons else "Triggered by Keyboard"
+                sub = ",".join(active_reasons)
                 cv2.putText(img, sub, (12, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (0, 0, 0), 4, cv2.LINE_AA)
                 cv2.putText(img, sub, (12, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                            color, 1, cv2.LINE_AA)
+                            (0, 0, 255), 1, cv2.LINE_AA)
         out.append(img)
     return out
 
@@ -951,6 +1006,75 @@ def _write_results(
             )
 
 
+def _safe_stack_or_none(items, dtype=None):
+    if not items:
+        return None
+    arr = np.stack(items, axis=0)
+    if dtype is not None:
+        arr = arr.astype(dtype)
+    return arr
+
+
+def _write_rollout_hdf5(
+    save_path: pathlib.Path,
+    task_description: str,
+    outcome: str,
+    ctrl_type: str,
+    publish_rate: int,
+    image_top: list,
+    image_right: list,
+    image_left: list,
+    qpos: list,
+    eef_pose: list,
+    actions: list,
+    is_rescue_step: list,
+    step_index: list,
+):
+    if h5py is None:
+        raise ImportError(
+            "h5py is required for --save_rollout but is not installed. \
+Install it with: pip install h5py"
+        )
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    top_arr = _safe_stack_or_none(image_top, dtype=np.uint8)
+    right_arr = _safe_stack_or_none(image_right, dtype=np.uint8)
+    left_arr = _safe_stack_or_none(image_left, dtype=np.uint8)
+    action_arr = _safe_stack_or_none(actions, dtype=np.float32)
+    qpos_arr = _safe_stack_or_none(qpos, dtype=np.float32)
+    eef_arr = _safe_stack_or_none(eef_pose, dtype=np.float32)
+    rescue_arr = np.asarray(is_rescue_step, dtype=np.uint8)
+    step_arr = np.asarray(step_index, dtype=np.int32)
+
+    with h5py.File(save_path, "w") as f:
+        f.attrs["task_description"] = task_description
+        f.attrs["outcome"] = outcome
+        f.attrs["ctrl_type"] = ctrl_type
+        f.attrs["publish_rate"] = int(publish_rate)
+        f.attrs["num_steps"] = int(len(step_arr))
+
+        obs = f.create_group("observations")
+        imgs = obs.create_group("images")
+        if top_arr is not None:
+            imgs.create_dataset("top", data=top_arr, compression="gzip", compression_opts=2)
+        if right_arr is not None:
+            imgs.create_dataset("right", data=right_arr, compression="gzip", compression_opts=2)
+        if left_arr is not None:
+            imgs.create_dataset("left", data=left_arr, compression="gzip", compression_opts=2)
+        if qpos_arr is not None:
+            obs.create_dataset("qpos", data=qpos_arr)
+        if eef_arr is not None:
+            obs.create_dataset("eef_pose", data=eef_arr)
+
+        if action_arr is not None:
+            f.create_dataset("action", data=action_arr)
+        f.create_dataset("step", data=step_arr)
+        f.create_dataset("is_rescue_step", data=rescue_arr)
+
+    logging.info(f"Rollout HDF5 written to {save_path}")
+
+
 def get_arguments():
     parser = argparse.ArgumentParser(
         description="Agilex SYNC inference: Dual Head (progress+success) + "
@@ -983,6 +1107,10 @@ def get_arguments():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--task", type=str, required=True)
     parser.add_argument("--video_out_path", type=str, default="data/agilex/output")
+    parser.add_argument("--save_rollout", action="store_true", default=False,
+                        help="Save executed rollout as an HDF5 file.")
+    parser.add_argument("--rollout_out_path", type=str, default="data/agilex/rollouts_hdf5",
+                        help="Directory for HDF5 rollout files when --save_rollout is enabled.")
     # ---- SDE policy ----
     parser.add_argument("--sde_host", type=str, default=None)
     parser.add_argument("--sde_port", type=int, default=8001)

@@ -1,39 +1,25 @@
 """
-Agilex robot inference (SYNC): Standalone DINOv2 Switch Head + SDE + DreamDojo + DINOv2 Value Expert.
+Agilex robot inference (SYNC): Switch Head V2 (temporal-attention, dual-label
+progress+success) + SDE + DreamDojo + DINOv2 Value Expert.
 
-Synchronous counterpart to agilex_infer_async_dinov2_value_switch.py.
-
-Differences from the async version:
-  - No inference thread, no StreamActionBuffer, no RTC/streaming.
-  - Re-plan every `chunk_size` steps with a blocking policy call.
-  - At each replan boundary, optionally query the switch head. If switch fires,
-    run SDE + DreamDojo + value expert to select the best action chunk.
-  - Otherwise, run a fresh ODE policy inference.
-
-Switch source:
-  - Primary (--switch_head_ckpt): standalone DINOv2SwitchHead trained by
-    train_switch_head_robometer.py on Robometer progress/success labels.
-  - Fallback (no --switch_head_ckpt): pi05-integrated 'switch' output from
-    the ODE policy server.
+Same control flow as `agilex_infer_dinov2_value_switch.py`, but swaps the v1
+standalone switch head for the v2 temporal-attention variant trained by
+`train_switch_head_v2.py`. The v2 head returns `(progress, success)` per step;
+the rescue trigger fires when `success > --switch_threshold`. Progress is
+logged but not used for triggering by default — pass `--progress_threshold`
+to additionally require `progress > progress_threshold`.
 
 Usage:
-  # 1. ODE policy server
-  python scripts/serve_policy.py policy:checkpoint \\
-      --policy.config pi05_libero --policy.dir <ode_ckpt> --port 8000
-
-  # 2. SDE policy server
-  python scripts/serve_policy.py policy:checkpoint \\
-      --policy.config pi05_sde_libero --policy.dir <sde_ckpt> --port 8001
-
-  # 3. DreamDojo servers (one per candidate, ports 8020..8024)
-
-  # 4. Run sync inference with standalone switch head
-  python agilex_infer_sync_dinov2_value_switch.py \\
-      --task towel --host 10.0.0.1 --port 8000 \\
+  # 1. ODE policy server (port 8000)
+  # 2. SDE policy server (port 8001)
+  # 3. DreamDojo servers (ports 8020..)
+  # 4. Run:
+  python agilex/agilex_infer_dinov2_value_switch_v2.py \\
+      --task cup --host 0.0.0.0 --port 8000 \\
       --sde_host 10.0.0.1 --sde_port 8001 \\
-      --switch_head_ckpt checkpoints/switch_head_robometer/best_model.pt \\
-      --value_expert_ckpt checkpoints/dinov2_value_expert/best_model.pt \\
-      --switch_threshold 0.5 --num_sde_samples 5 --dd_base_port 8020
+      --switch_head_ckpt agilex/checkpoints/switch_head_v2/best_model.pt \\
+      --value_expert_ckpt agilex/checkpoints/dinov2_value_expert/best_model.pt \\
+      --switch_threshold 0.5 --num_sde_samples 1 --dd_base_port 8020
 """
 
 import argparse
@@ -63,6 +49,7 @@ from clients import OpenpiClient
 from agilex_utils import check_keyboard_input, get_config, handle_interactive_mode, process_action
 from ros_operator import RosOperator, get_ros_observation
 from train_dinov2_value_expert import DINOv2ValueExpert
+from infer_switch_head_v2 import StandaloneSwitchHeadV2
 
 
 ROLLOUT_FPS = 10
@@ -73,42 +60,95 @@ observation_window_lock = threading.Lock()
 shutdown_event = threading.Event()
 
 
-class StandaloneSwitchHead:
-    """Wraps the standalone DINOv2SwitchHead trained by train_switch_head_robometer.py."""
+def _evaluate_rescue_trigger(
+    switch_history,
+    current_frame: int,
+    episode_len: int,
+    replan_interval: int,
+    success_threshold: float,
+    adaptive_base: float,
+    adaptive_slope: float,
+    adaptive_time_frac: float,
+    success_time_frac: float,
+    progress_drop: float,
+    progress_rise_veto: float,
+    veto_window_frames: int,
+) -> dict:
+    """Evaluate the dual-head rescue rules against the (progress, success) probe history.
 
-    def __init__(self, checkpoint_path: str, dinov2_model: str = "dinov2_vitb14",
-                 hidden_dim: int = 256, state_dim: int = 14, num_cameras: int = 3,
-                 device: str | None = None):
-        from train_switch_head_robometer import DINOv2SwitchHead
+    Trigger if ANY holds:
+      R1. progress < adaptive_base + time_fraction * adaptive_slope
+          AND time_fraction >= adaptive_time_frac
+      R2. progress has dropped by >= progress_drop over the last
+          (replan_interval * 2) frames
+      R3. success < success_threshold AND time_fraction >= success_time_frac
 
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.model = DINOv2SwitchHead(
-            dinov2_model=dinov2_model,
-            hidden_dim=hidden_dim,
-            state_dim=state_dim,
-            num_cameras=num_cameras,
-            freeze_backbone=True,
-        )
-        sd = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
-        self.model.load_state_dict(sd)
-        self.model.to(self.device).eval()
+    Veto: do NOT trigger if progress has risen by >= progress_rise_veto within
+    the most recent veto_window_frames.
 
-    def _frame_to_tensor(self, frame_hwc: np.ndarray) -> torch.Tensor:
-        return torch.from_numpy(np.asarray(frame_hwc)).permute(2, 0, 1).float() / 255.0
+    Returns a dict with `should_trigger` (bool), `progress`, `success`, and
+    `reasons` (list of firing rule names).
+    """
+    result = {
+        "should_trigger": False,
+        "progress": None,
+        "success": None,
+        "reasons": [],
+        "time_fraction": None,
+        "progress_drop_obs": None,
+        "progress_rise_recent": None,
+    }
+    if not switch_history:
+        return result
 
-    @torch.no_grad()
-    def predict(self, top, right, left, state_np: np.ndarray) -> float:
-        """Each camera arg is either a single (H,W,3) uint8 frame or a list of such (clip)."""
-        images = []
-        for cam in (top, right, left):
-            if isinstance(cam, list):
-                t = torch.stack([self._frame_to_tensor(f) for f in cam]).unsqueeze(0)
-            else:
-                t = self._frame_to_tensor(cam).unsqueeze(0)
-            images.append(t.to(self.device))
-        state_t = torch.from_numpy(state_np.astype(np.float32)).unsqueeze(0).to(self.device)
-        prob = self.model.predict_switch_prob(images, state_t)
-        return float(prob.item())
+    latest = switch_history[-1]
+    cur_p = float(latest["progress"])
+    cur_s = float(latest["success"])
+    frame_no = int(latest["frame"])
+    tf = frame_no / max(episode_len, 1)
+    result.update({"progress": cur_p, "success": cur_s, "time_fraction": tf})
+
+    drop_window = max(replan_interval * 2, 1)
+    window_entry = None
+    for h in reversed(switch_history):
+        if int(h["frame"]) <= frame_no - drop_window:
+            window_entry = h
+            break
+    drop_obs = (
+        float(window_entry["progress"]) - cur_p
+        if window_entry is not None else 0.0
+    )
+    result["progress_drop_obs"] = drop_obs
+
+    recent_entry = None
+    for h in reversed(switch_history):
+        if int(h["frame"]) <= frame_no - max(veto_window_frames, 1):
+            recent_entry = h
+            break
+    rise_recent = (
+        cur_p - float(recent_entry["progress"])
+        if recent_entry is not None else 0.0
+    )
+    result["progress_rise_recent"] = rise_recent
+
+    reasons = []
+    adaptive_th = adaptive_base + tf * adaptive_slope
+    if cur_p < adaptive_th and tf >= adaptive_time_frac:
+        reasons.append(f"low_progress<{adaptive_th:.3f}")
+    if drop_obs >= progress_drop:
+        reasons.append(f"progress_drop={drop_obs:.3f}")
+    if cur_s < success_threshold and tf >= success_time_frac:
+        reasons.append(f"low_success<{success_threshold:.3f}")
+
+    veto = rise_recent >= progress_rise_veto
+    if veto:
+        result["reasons"] = [f"veto_progress_rise={rise_recent:.3f}"]
+        return result
+
+    if reasons:
+        result["should_trigger"] = True
+        result["reasons"] = reasons
+    return result
 
 
 class SwitchClipBuffer:
@@ -219,7 +259,7 @@ def _dreamdojo_generate(host: str, port: int, frame_np: np.ndarray, actions: np.
     try:
         resp = requests.post(url, json=payload, timeout=600)
         resp.raise_for_status()
-        return resp.json()
+        return resp.json()["save_path"]
     except Exception as e:
         logging.error(f"[DreamDojo port={port}] generation failed: {e}")
         return None
@@ -467,22 +507,28 @@ def model_inference(args, config, ros_operator):
     elif args.value_expert_ckpt:
         logging.warning(f"Value expert checkpoint not found: {args.value_expert_ckpt}")
 
-    # Standalone DINOv2 switch head.
+    # Standalone DINOv2 switch head V2 (temporal attention, dual-label progress+success).
     standalone_switch_head = None
     if args.switch_head_ckpt and os.path.exists(args.switch_head_ckpt):
-        standalone_switch_head = StandaloneSwitchHead(
+        standalone_switch_head = StandaloneSwitchHeadV2(
             checkpoint_path=args.switch_head_ckpt,
             dinov2_model=args.switch_head_dinov2_model,
-            hidden_dim=args.switch_head_hidden_dim,
             state_dim=14,
             num_cameras=3,
+            max_clip_frames=args.switch_head_clip_len,
+            attn_dim=args.switch_head_attn_dim,
+            attn_heads=args.switch_head_attn_heads,
+            attn_layers=args.switch_head_attn_layers,
+            hidden_dim=args.switch_head_hidden_dim,
         )
         logging.info(
-            f"Standalone switch head loaded from {args.switch_head_ckpt} "
-            f"(use_clip={args.switch_head_use_clip}, clip_len={args.switch_head_clip_len})"
+            f"Switch head V2 loaded from {args.switch_head_ckpt} "
+            f"(clip_len={args.switch_head_clip_len}, "
+            f"attn_dim={args.switch_head_attn_dim}, "
+            f"attn_layers={args.switch_head_attn_layers})"
         )
     elif args.switch_head_ckpt:
-        logging.warning(f"Switch head checkpoint not found: {args.switch_head_ckpt}")
+        logging.warning(f"Switch head V2 checkpoint not found: {args.switch_head_ckpt}")
 
     can_switch = sde_policy is not None and value_scorer is not None
 
@@ -529,6 +575,10 @@ def model_inference(args, config, ros_operator):
                 else None
             )
 
+            # Fine-grained (progress, success) probes every --replan_interval frames.
+            # Each entry: {"frame": int, "progress": float, "success": float}
+            switch_history: collections.deque = collections.deque(maxlen=32)
+
             task_segment = task_description.replace(" ", "_")
             rollout_dir = output_dir / f"rollout_{task_segment}_ep{episode_idx}_running"
             rollout_dir.mkdir(parents=True, exist_ok=True)
@@ -574,6 +624,34 @@ def model_inference(args, config, ros_operator):
                             left_img = ros_operator.bridge.imgmsg_to_cv2(left_msg, "passthrough")
                             clip_buffer.update(front_img, right_img, left_img)
 
+                # Probe switch head every --replan_interval frames to keep a history of
+                # (progress, success) for the trend-based rescue rules below.
+                if (
+                    standalone_switch_head is not None
+                    and frame_counter > 0
+                    and frame_counter % max(args.replan_interval, 1) == 0
+                    and clip_buffer is not None
+                    and clip_buffer.ready()
+                ):
+                    with observation_window_lock:
+                        probe_state = (
+                            observation_window[-1]["qpos"]
+                            if observation_window is not None
+                            and len(observation_window) > 0
+                            and observation_window[-1]["qpos"] is not None
+                            else None
+                        )
+                    if probe_state is not None:
+                        top_c, right_c, left_c = clip_buffer.clips()
+                        probe_p, probe_s = standalone_switch_head.predict(
+                            top_c, right_c, left_c, probe_state,
+                        )
+                        switch_history.append({
+                            "frame": frame_counter,
+                            "progress": float(probe_p),
+                            "success": float(probe_s),
+                        })
+
                 # Replan at every chunk boundary
                 if t % chunk_size == 0:
                     update_observation_window(args, config, ros_operator)
@@ -590,37 +668,35 @@ def model_inference(args, config, ros_operator):
 
                     triggered = False
                     if can_switch and frame_counter > 0:
-                        cur_switch_prob = None
-                        if standalone_switch_head is not None:
-                            with observation_window_lock:
-                                switch_state = observation_window[-1]["qpos"]
-                            if clip_buffer is not None and clip_buffer.ready():
-                                top_c, right_c, left_c = clip_buffer.clips()
-                                cur_switch_prob = standalone_switch_head.predict(
-                                    top_c, right_c, left_c, switch_state,
-                                )
-                            else:
-                                cur_switch_prob = standalone_switch_head.predict(
-                                    obs_snapshot["top"], obs_snapshot["right"],
-                                    obs_snapshot["left"], switch_state,
-                                )
-                        else:
-                            ode_result = policy.predict_action(obs_snapshot)
-                            if isinstance(ode_result, dict):
-                                cur_switch_prob = ode_result.get("switch", None)
+                        trigger_decision = _evaluate_rescue_trigger(
+                            switch_history=switch_history,
+                            current_frame=frame_counter,
+                            episode_len=max_publish_step,
+                            replan_interval=args.replan_interval,
+                            success_threshold=args.switch_threshold,
+                            adaptive_base=args.adaptive_base,
+                            adaptive_slope=args.adaptive_slope,
+                            adaptive_time_frac=args.adaptive_time_frac,
+                            success_time_frac=args.success_time_frac,
+                            progress_drop=args.progress_drop,
+                            progress_rise_veto=args.progress_rise_veto,
+                            veto_window_frames=args.veto_window_frames,
+                        )
 
-                        if cur_switch_prob is not None and cur_switch_prob > args.switch_threshold:
+                        if trigger_decision["should_trigger"]:
+                            cur_progress = trigger_decision["progress"]
+                            cur_success = trigger_decision["success"]
                             logging.info(
-                                f"[Switch] Triggered at frame {frame_counter} "
-                                f"(prob={cur_switch_prob:.3f} > {args.switch_threshold})"
+                                f"[SwitchV2] Triggered at frame {frame_counter}: "
+                                f"progress={cur_progress:.3f} success={cur_success:.3f} "
+                                f"reasons={trigger_decision['reasons']}"
                             )
-
-                            print(f"\n\033[93m>>> [System] SDE Policy triggered (prob: {cur_switch_prob:.3f})!\033[0m", flush=True)
-                            print(f"\033[93m>>> [System] Waiting for DreamDojo to generate {args.num_sde_samples} candidate videos and Value Expert to score them. Please wait... <<<\033[0m\n", flush=True)
-
                             switch_log.append({
                                 "frame": frame_counter,
-                                "switch_prob": float(cur_switch_prob),
+                                "switch_prob": float(cur_success),
+                                "progress": float(cur_progress),
+                                "success": float(cur_success),
+                                "reasons": trigger_decision["reasons"],
                             })
 
                             step_save_dir = rollout_dir / "switch_steps" / f"frame{frame_counter}"
@@ -635,18 +711,11 @@ def model_inference(args, config, ros_operator):
                                 dd_base_port=args.dd_base_port,
                                 num_samples=args.num_sde_samples,
                             )
-
-                            best_score = sel_record.get('best_score', 'N/A')
-                            if isinstance(best_score, float):
-                                best_score_str = f"{best_score:.4f}"
-                            else:
-                                best_score_str = str(best_score)
-
-                            print(f"\n\033[92m>>> [System] Evaluation complete! Selected optimal action sequence (Candidate ID: {sel_record.get('best_idx')}, Score: {best_score_str})\033[0m", flush=True)
-                            print(f"\033[92m>>> [System] Injecting actions into buffer. Robot resuming execution! <<<\033[0m\n", flush=True)
-                            
                             sel_record["frame"] = frame_counter
-                            sel_record["switch_prob"] = float(cur_switch_prob)
+                            sel_record["switch_prob"] = float(cur_success)
+                            sel_record["progress"] = float(cur_progress)
+                            sel_record["success"] = float(cur_success)
+                            sel_record["reasons"] = trigger_decision["reasons"]
                             value_selections.append(sel_record)
 
                             L = min(best_actions.shape[0], chunk_size)
@@ -806,19 +875,44 @@ def get_arguments():
     parser.add_argument("--combined", action="store_true", default=False,
                         help="Single combined ODE+SDE server (scripts/serve_combined_policy.py). "
                              "SDE queries are sent to --host:--port with mode='sde' unless --sde_host is set.")
-    # ---- Switch head ----
+    # ---- Switch head V2 (temporal attention; dual progress+success soft labels) ----
+    # Rescue trigger rules (any-of, with veto). Defaults match the spec:
+    #   R1 low_progress:  progress < adaptive_base + time_frac * adaptive_slope
+    #                     (0.25 + tf * 0.3), once tf >= adaptive_time_frac (0.15)
+    #   R2 progress_drop: drop >= progress_drop (0.05) over last replan_interval*2 frames
+    #   R3 low_success:   success < switch_threshold (0.5), once tf >= success_time_frac (0.10)
+    #   Veto: progress rose >= progress_rise_veto (0.02) within last veto_window_frames (3)
     parser.add_argument("--switch_threshold", type=float, default=0.5,
-                        help="Prob threshold for switching ODE → SDE")
+                        help="R3 threshold: trigger when success < this (default 0.5)")
+    parser.add_argument("--adaptive_base", type=float, default=0.25,
+                        help="R1 intercept of adaptive progress threshold")
+    parser.add_argument("--adaptive_slope", type=float, default=0.3,
+                        help="R1 slope (× time_fraction) of adaptive progress threshold")
+    parser.add_argument("--adaptive_time_frac", type=float, default=0.15,
+                        help="R1 minimum episode time fraction elapsed before activating")
+    parser.add_argument("--success_time_frac", type=float, default=0.10,
+                        help="R3 minimum episode time fraction elapsed before activating")
+    parser.add_argument("--progress_drop", type=float, default=0.05,
+                        help="R2 progress drop over window=replan_interval*2 frames")
+    parser.add_argument("--progress_rise_veto", type=float, default=0.02,
+                        help="Veto threshold: skip rescue if progress rose ≥ this recently")
+    parser.add_argument("--veto_window_frames", type=int, default=3,
+                        help="Lookback (frames) for the progress-rise veto")
+    parser.add_argument("--replan_interval", type=int, default=3,
+                        help="Probe switch head every N frames to populate the trend history")
     parser.add_argument("--switch_head_ckpt", type=str, default=None,
-                        help="Standalone DINOv2SwitchHead checkpoint (.pt). If not set, "
-                             "falls back to the pi05-integrated 'switch' output.")
+                        help="DINOv2TemporalSwitchHead (v2) checkpoint (.pt). If not set, "
+                             "falls back to the pi05-integrated 'switch' output from the ODE server.")
     parser.add_argument("--switch_head_dinov2_model", type=str, default="dinov2_vitb14",
                         choices=["dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"])
     parser.add_argument("--switch_head_hidden_dim", type=int, default=256)
+    parser.add_argument("--switch_head_attn_dim", type=int, default=384)
+    parser.add_argument("--switch_head_attn_heads", type=int, default=4)
+    parser.add_argument("--switch_head_attn_layers", type=int, default=2)
     parser.add_argument("--switch_head_clip_len", type=int, default=20,
-                        help="Rolling clip length (frames per cam) — match training clip_len")
+                        help="Rolling clip length (frames per cam) — match training max_clip_frames")
     parser.add_argument("--switch_head_use_clip", action="store_true", default=True,
-                        help="Feed the standalone head multi-frame clips (training default)")
+                        help="Feed v2 head multi-frame clips (training default)")
     parser.add_argument("--switch_head_no_clip", dest="switch_head_use_clip",
                         action="store_false",
                         help="Use single-frame input instead of clips")

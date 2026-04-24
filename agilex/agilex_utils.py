@@ -1,10 +1,14 @@
+import argparse
+import os
 from pathlib import Path
 import select
 import sys
 import time
 
 import cv2
+import dm_env
 import numpy as np
+import rospy
 import yaml
 
 
@@ -119,6 +123,132 @@ def handle_interactive_mode(task_time):
         elif key == "q":
             print("Stopping...")
             return "quit"
+
+
+def save_inference_data(args, timesteps, actions, dataset_path):
+    import h5py
+
+    data_size = len(actions)
+    first_observation = timesteps[0].observation if timesteps else None
+    if first_observation is None:
+        raise ValueError("No timesteps available for saving")
+
+    data_dict = {
+        "/observations/qpos": [],
+        "/observations/eef_pose": [],
+        "/action": [],
+    }
+
+    for cam_name in args.camera_names:
+        data_dict[f"/observations/images/{cam_name}"] = []
+
+    while actions:
+        action = actions.pop(0)
+        ts = timesteps.pop(0)
+
+        data_dict["/observations/qpos"].append(ts.observation["qpos"])
+        data_dict["/observations/eef_pose"].append(ts.observation["eef_pose"])
+        data_dict["/action"].append(action)
+
+        for cam_name in args.camera_names:
+            data_dict[f"/observations/images/{cam_name}"].append(ts.observation["images"][cam_name])
+
+    t0 = time.time()
+    with h5py.File(dataset_path + ".hdf5", "w", rdcc_nbytes=1024**2 * 2) as root:
+        root.attrs["rollout"] = True
+
+        obs = root.create_group("observations")
+        image = obs.create_group("images")
+        for cam_name in args.camera_names:
+            _ = image.create_dataset(
+                cam_name,
+                (data_size, 480, 640, 3),
+                dtype="uint8",
+                chunks=(1, 480, 640, 3),
+            )
+
+        _ = obs.create_dataset("qpos", (data_size, 14))
+        _ = obs.create_dataset("eef_pose", (data_size, 14))
+        _ = root.create_dataset("action", (data_size, 14))
+
+        for name, array in data_dict.items():
+            root[name][...] = array
+    print(f"\033[32m\nSaving: {time.time() - t0:.1f} secs. %s \033[0m\n" % dataset_path)
+
+
+class InferenceDataRecorder:
+    def __init__(self, args, config, shutdown_event=None):
+        self.enabled = args.save_rollout
+        self.shutdown_event = shutdown_event
+        self.save_args = argparse.Namespace(camera_names=config["camera_names"])
+        self.save_dir = os.path.expanduser(args.save_dir)
+        self.episode_idx = 0
+        if self.enabled:
+            from collect_data.collect_data_new import get_next_episode_idx
+
+            os.makedirs(self.save_dir, exist_ok=True)
+            self.episode_idx = get_next_episode_idx(self.save_dir)
+            print(f"Rollout recording enabled: {self.save_dir}, next episode {self.episode_idx}")
+        self.reset()
+
+    def reset(self):
+        self.timesteps = []
+        self.actions = []
+
+    def add_step(self, observation, action):
+        if not self.enabled or observation is None:
+            return
+
+        step_type = dm_env.StepType.FIRST if len(self.timesteps) == 0 else dm_env.StepType.MID
+        self.timesteps.append(
+            dm_env.TimeStep(
+                step_type=step_type,
+                reward=None,
+                discount=None,
+                observation=observation,
+            )
+        )
+        self.actions.append(np.asarray(action).copy())
+
+        if len(self.actions) % 50 == 0:
+            print(f"Recorded inference frames: {len(self.actions)}")
+
+    def should_stop_waiting(self):
+        return rospy.is_shutdown() or (self.shutdown_event is not None and self.shutdown_event.is_set())
+
+    def wait_save_choice(self):
+        print(
+            "\n\033[33m\nRollout paused. Press 's' to SAVE or 'q' to DISCARD: \033[0m",
+            end="",
+            flush=True,
+        )
+        while not self.should_stop_waiting():
+            key = sys.stdin.read(1).lower()
+            if key in {"s", "q"}:
+                print(key)
+                return key
+        return "q"
+
+    def save_episode(self):
+        if not self.enabled:
+            return
+        if len(self.actions) == 0:
+            print("\033[31m\nNo inference data to save (0 frames recorded).\033[0m")
+            self.reset()
+            return
+
+        print("len(timesteps): ", len(self.timesteps))
+        print("len(actions)  : ", len(self.actions))
+        if self.wait_save_choice() != "s":
+            print(f"\033[31m\nEpisode discarded. {len(self.actions)} frames thrown away.\033[0m")
+            self.reset()
+            return
+
+        dataset_path = os.path.join(self.save_dir, f"episode_{self.episode_idx}")
+        save_inference_data(self.save_args, self.timesteps.copy(), self.actions.copy(), dataset_path)
+        print(f"\033[32mEpisode {self.episode_idx} saved successfully!\033[0m")
+        self.episode_idx += 1
+        self.reset()
 
 
 def convert_to_uint8(img: np.ndarray) -> np.ndarray:

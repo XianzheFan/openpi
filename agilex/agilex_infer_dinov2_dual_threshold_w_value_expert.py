@@ -315,6 +315,7 @@ def inference_fn_sync(args, config, policy, ros_operator):
 def _select_best_action_with_prefix(
     obs_snapshot: dict,
     sde_policy: "OpenpiClient",
+    value_scorer: ValueExpertScorer,
     exec_horizon: int,
     task_description: str,
     step_save_dir: pathlib.Path,
@@ -324,12 +325,20 @@ def _select_best_action_with_prefix(
     prefix_action: "np.ndarray | None",
     skip_steps: int,
 ) -> tuple[np.ndarray, dict]:
-    """Sends action candidates to DreamDojo server, which generates the video 
-    AND scores it in-memory, returning the score over the network.
+    """Same pipeline as ``_select_best_action_with_value_expert`` but with a
+    consistent "hold prefix" modification: the first ``skip_steps`` actions of
+    every sampled SDE chunk are replaced with ``prefix_action`` before the chunk
+    is sent to DreamDojo AND before it is returned for execution. This keeps
+    value-expert scoring and on-robot execution aligned, and avoids the
+    "rescue first swings home" behavior of the raw SDE chunk head.
+
+    When ``skip_steps == 0`` or ``prefix_action`` is None, this degenerates to
+    the original behavior.
     """
     step_save_dir.mkdir(parents=True, exist_ok=True)
 
     raw_chunks = [np.asarray(sde_policy.predict_action(obs_snapshot)) for _ in range(num_samples)]
+
     skip = int(max(0, skip_steps))
     action_chunks: list[np.ndarray] = []
     for ch in raw_chunks:
@@ -340,19 +349,19 @@ def _select_best_action_with_prefix(
         action_chunks.append(ch)
 
     frame_img = obs_snapshot["top"]
-    save_prefix = str(step_save_dir.absolute())
+    save_prefix = step_save_dir.name
     tasks = [
         {
             "host": dd_host,
             "port": dd_base_port + i,
             "actions": np.asarray(action_chunks[i][:exec_horizon], dtype=np.float32),
             "save_name": f"{save_prefix}/chunk_{i}",
-        } # 强制使用绝对路径，确保服务端能存到你这里
+        }
         for i in range(num_samples)
     ]
 
     logging.info(
-        f"[Dual] Launching {num_samples} DreamDojo gens+scores "
+        f"[Dual] Launching {num_samples} DreamDojo gens "
         f"(prefix_skip={skip}, horizon={exec_horizon})..."
     )
 
@@ -364,45 +373,64 @@ def _select_best_action_with_prefix(
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, num_samples)) as ex:
         futures = {ex.submit(_submit, t): i for i, t in enumerate(tasks)}
-        results_dict: dict[int, dict] = {}
+        save_paths: dict[int, str] = {}
         for fut in concurrent.futures.as_completed(futures):
             idx = futures[fut]
-            try:
-                results_dict[idx] = fut.result()
-            except Exception as e:
-                logging.error(f"[Dual] Request {idx} failed: {e}")
-                results_dict[idx] = None
+            save_paths[idx] = fut.result()
+
+    valid = [
+        (i, save_paths[i]) for i in range(num_samples)
+        if save_paths.get(i) and os.path.exists(save_paths[i])
+    ]
+
+    if not valid:
+        logging.warning("[Dual] All DreamDojo generations failed; using chunk 0.")
+        return np.asarray(action_chunks[0][:exec_horizon]), {
+            "num_candidates": 0,
+            "candidate_scores": {},
+            "best_idx": 0,
+            "prefix_skip_steps": skip,
+            "error": "All DreamDojo generations failed",
+        }
+
+    local_valid: list[tuple[int, str]] = []
+    for orig_i, orig_path in valid:
+        dst = step_save_dir / f"output_{orig_i}.mp4"
+        try:
+            shutil.copy2(orig_path, dst)
+            local_valid.append((orig_i, str(dst)))
+        except Exception as e:
+            logging.warning(f"[Dual] Could not copy {orig_path} -> {dst}: {e}")
+            local_valid.append((orig_i, orig_path))
 
     candidate_scores: dict[int, float] = {}
-    local_valid: list[tuple[int, str]] = []
-
-    for orig_i in range(num_samples):
-        res = results_dict.get(orig_i)
-        if res and res.get("score") is not None:
-            score = float(res["score"])
-            candidate_scores[orig_i] = score
-            logging.info(f"[ServerScore] Candidate {orig_i} evaluated by server: score={score:.4f}")
-            orig_path = res.get("save_path")
-            if orig_path and os.path.exists(orig_path):
-                dst = step_save_dir / f"output_{orig_i}.mp4"
-                try:
-                    shutil.copy2(orig_path, dst)
-                    local_valid.append((orig_i, str(dst)))
-                except Exception as e:
-                    logging.warning(f"[Dual] Could not copy {orig_path} -> {dst}: {e}")
-                    local_valid.append((orig_i, orig_path))
-        else:
-            logging.warning(f"[Dual] Candidate {orig_i} failed or returned no score.")
+    per_window_details: dict[int, list] = {}
+    for orig_i, video_path in local_valid:
+        try:
+            frames = imageio.mimread(video_path)
+            frames = [np.asarray(f) for f in frames]
+        except Exception as e:
+            logging.error(f"[ValueExpert] Failed to read {video_path}: {e}")
+            continue
+        per_window = value_scorer.score_video(video_frames=frames)
+        agg_score = value_scorer.aggregate_video_score(per_window)
+        candidate_scores[orig_i] = float(agg_score)
+        per_window_details[orig_i] = per_window.tolist()
+        logging.info(
+            f"[ValueExpert] Candidate {orig_i}: agg={agg_score:.4f} "
+            f"(windows={len(per_window)}, min={per_window.min():.4f})"
+        )
 
     if not candidate_scores:
-        logging.warning("[Dual] All video generations/scoring failed; using chunk 0.")
-        best_idx = 0
+        logging.warning("[Dual] All video scoring failed; using first valid chunk.")
+        best_idx = local_valid[0][0]
     else:
         best_idx = min(candidate_scores, key=candidate_scores.get)
 
     selection_record = {
-        "num_candidates": len(candidate_scores),
+        "num_candidates": len(local_valid),
         "candidate_scores": {str(k): v for k, v in candidate_scores.items()},
+        "per_window_details": {str(k): v for k, v in per_window_details.items()},
         "best_idx": int(best_idx),
         "best_score": candidate_scores.get(best_idx, float("inf")),
         "prefix_skip_steps": skip,
@@ -547,7 +575,6 @@ def model_inference(args, config, ros_operator):
             t = 0
 
             while t < max_publish_step and not rospy.is_shutdown() and not shutdown_event.is_set():
-                manual_rescue_pressed = False
                 key = check_keyboard_input()
                 if key == " ":
                     result = handle_interactive_mode(task_time)
@@ -558,9 +585,6 @@ def model_inference(args, config, ros_operator):
                     elif result == "quit":
                         user_stopped = True
                         return
-                elif key == "s":
-                    manual_rescue_pressed = True
-                    print("\n\033[93m>>> [System] Key 's' detected! Manually triggering SDE + DreamDojo rescue mechanism!\033[0m", flush=True)
 
                 # Capture current frame for rollout video + clip buffer.
                 front_msg = (
@@ -604,17 +628,13 @@ def model_inference(args, config, ros_operator):
 
                 # ----- Rescue check at fixed interval (independent of chunk boundary) -----
                 rescue_triggered = False
-                should_check_auto = (
+                if (
                     can_switch
                     and frame_counter > 0
                     and (t - last_rescue_check_t) >= rescue_check_stride
                     and (t - last_rescue_trigger_t) >= rescue_cooldown_steps
-                )
-
-                if can_switch and (should_check_auto or manual_rescue_pressed):
-                    if should_check_auto:
-                        last_rescue_check_t = t
-
+                ):
+                    last_rescue_check_t = t
                     update_observation_window(args, config, ros_operator)
                     obs_snapshot = _get_obs_snapshot(args, config)
 
@@ -639,14 +659,9 @@ def model_inference(args, config, ros_operator):
                         )
 
                     time_fraction = t / max(max_publish_step - 1, 1)
-                    auto_triggered, reasons, info = checker.add_and_check(
+                    triggered, reasons, info = checker.add_and_check(
                         progress_p, success_p, time_fraction,
                     )
-
-                    triggered = auto_triggered or manual_rescue_pressed
-                    if manual_rescue_pressed:
-                        reasons.append("manual_keyboard_override")
-
                     dual_head_log.append({
                         "t": t,
                         "frame": frame_counter,
@@ -689,6 +704,7 @@ def model_inference(args, config, ros_operator):
                         best_actions, sel_record = _select_best_action_with_prefix(
                             obs_snapshot=obs_snapshot,
                             sde_policy=sde_policy,
+                            value_scorer=value_scorer,
                             exec_horizon=chunk_size,
                             task_description=task_description,
                             step_save_dir=step_save_dir,
@@ -819,16 +835,7 @@ def _draw_dualhead_hud(
     Modifies ``img`` in place and returns it.
     """
     h, _w = img.shape[:2]
-
-    is_manual = rescue_active and ("manual_keyboard_override" in reasons)
-
-    if is_manual:
-        main_color = (0, 165, 255)
-    elif rescue_active:
-        main_color = (0, 0, 255)
-    else:
-        main_color = (0, 220, 0)
-
+    main_color = (0, 0, 255) if rescue_active else (0, 220, 0)
     main_txt = f"p={progress:.2f}  s={success:.2f}  tf={time_fraction:.2f}"
     y = h - 16
     cv2.putText(img, main_txt, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
@@ -837,11 +844,9 @@ def _draw_dualhead_hud(
                 main_color, 2, cv2.LINE_AA)
     sub = ""
     if rescue_active:
-        sub = "MANUAL OVERRIDE" if is_manual else "RESCUE"
-        display_reasons = [r for r in reasons if r != "manual_keyboard_override"]
-        if display_reasons:
-            sub += ": " + ",".join(display_reasons)
-
+        sub = "RESCUE"
+        if reasons:
+            sub += ": " + ",".join(reasons)
     if sub:
         cv2.putText(img, sub, (12, y - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                     (0, 0, 0), 3, cv2.LINE_AA)
@@ -876,30 +881,21 @@ def _annotate_rescue_frames(frames: list, rescue_log: list, window: int) -> list
             active_s = float(events[ev_idx].get("success", 0.0))
             active_reasons = list(events[ev_idx].get("reasons", []))
             ev_idx += 1
-
         img = np.ascontiguousarray(np.asarray(frm))
         if frame_no <= active_until:
             h, w = img.shape[:2]
-
-            is_manual = "manual_keyboard_override" in active_reasons
-            color = (0, 165, 255) if is_manual else (0, 0, 255)
-            prefix = "MANUAL OVERRIDE" if is_manual else "RESCUE"
-
-            cv2.rectangle(img, (0, 0), (w - 1, h - 1), color, 4)
-
-            txt = f"{prefix} p={active_p:.2f} s={active_s:.2f}"
+            cv2.rectangle(img, (0, 0), (w - 1, h - 1), (0, 0, 255), 4)
+            txt = f"RESCUE p={active_p:.2f} s={active_s:.2f}"
             cv2.putText(img, txt, (12, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                         (0, 0, 0), 5, cv2.LINE_AA)
             cv2.putText(img, txt, (12, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
-                        color, 2, cv2.LINE_AA)
-
+                        (0, 0, 255), 2, cv2.LINE_AA)
             if active_reasons:
-                display_reasons = [r for r in active_reasons if r != "manual_keyboard_override"]
-                sub = ",".join(display_reasons) if display_reasons else "Triggered by Keyboard"
+                sub = ",".join(active_reasons)
                 cv2.putText(img, sub, (12, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (0, 0, 0), 4, cv2.LINE_AA)
                 cv2.putText(img, sub, (12, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                            color, 1, cv2.LINE_AA)
+                            (0, 0, 255), 1, cv2.LINE_AA)
         out.append(img)
     return out
 

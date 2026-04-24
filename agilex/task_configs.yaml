@@ -68,3 +68,10 @@ cup:
   right0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1]
   action_postprocess:
     right_gripper: *default_right_gripper_postprocess
+
+plug:
+  language_instruction: "Plug the charger into the socket."
+  left0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0]
+  right0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.028]
+  action_postprocess:
+    right_gripper: *default_right_gripper_postprocess

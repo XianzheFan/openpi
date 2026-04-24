@@ -103,13 +103,21 @@ class RosOperator:
     def _format_sync_failure(self, stream_map, frame_time=None):
         missing_streams = []
         stale_streams = []
+        stream_states = []
         for name, queue in stream_map.items():
             if len(queue) == 0:
                 missing_streams.append(name)
+                stream_states.append(f"{name}:len=0")
                 continue
             latest_stamp = self._get_msg_stamp(queue[-1])
             if frame_time is not None and latest_stamp < frame_time:
                 stale_streams.append(f"{name}={latest_stamp:.6f}")
+            if frame_time is None:
+                stream_states.append(f"{name}:len={len(queue)},latest={latest_stamp:.6f}")
+            else:
+                stream_states.append(
+                    f"{name}:len={len(queue)},latest={latest_stamp:.6f},delta={latest_stamp - frame_time:+.4f}s"
+                )
 
         details = []
         if frame_time is not None:
@@ -118,6 +126,8 @@ class RosOperator:
             details.append("missing=" + ",".join(missing_streams))
         if stale_streams:
             details.append("stale=" + ",".join(stale_streams))
+        if stream_states:
+            details.append("streams=[" + "; ".join(stream_states) + "]")
         return " | ".join(details) if details else "unknown sync state"
 
     def _resolve_frame_time(self, camera_queues):
@@ -136,6 +146,16 @@ class RosOperator:
 
     def _pop_synced_image(self, queue, frame_time, border_padding=None):
         image = self.bridge.imgmsg_to_cv2(self._pop_synced_message(queue, frame_time), "passthrough")
+        if border_padding is not None:
+            top, bottom, left, right = border_padding
+            image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
+        return image
+
+    def _peek_latest_message(self, queue):
+        return queue[-1]
+
+    def _peek_latest_image(self, queue, border_padding=None):
+        image = self.bridge.imgmsg_to_cv2(queue[-1], "passthrough")
         if border_padding is not None:
             top, bottom, left, right = border_padding
             image = cv2.copyMakeBorder(image, top, bottom, left, right, cv2.BORDER_CONSTANT, value=0)
@@ -289,6 +309,43 @@ class RosOperator:
             img_front_depth = self._pop_synced_image(self.front_depth_image_queue, frame_time)
             img_left_depth = self._pop_synced_image(self.left_depth_image_queue, frame_time)
             img_right_depth = self._pop_synced_image(self.right_depth_image_queue, frame_time)
+
+        return (
+            True,
+            (
+                img_front,
+                img_left,
+                img_right,
+                img_front_depth,
+                img_left_depth,
+                img_right_depth,
+                puppet_arm_left,
+                puppet_arm_right,
+                puppet_arm_left_pose,
+                puppet_arm_right_pose,
+            ),
+        )
+
+    def get_latest_inference_frame(self):
+        stream_map = self._inference_stream_map()
+        if any(len(queue) == 0 for queue in stream_map.values()):
+            return False, self._format_sync_failure(stream_map)
+
+        img_front = self._peek_latest_image(self.front_image_queue)
+        img_left = self._peek_latest_image(self.left_image_queue)
+        img_right = self._peek_latest_image(self.right_image_queue)
+        puppet_arm_left = self._peek_latest_message(self.puppet_left_arm_queue)
+        puppet_arm_right = self._peek_latest_message(self.puppet_right_arm_queue)
+        _, puppet_arm_left_pose = self._peek_latest_message(self.puppet_arm_left_pose_queue)
+        _, puppet_arm_right_pose = self._peek_latest_message(self.puppet_arm_right_pose_queue)
+
+        img_front_depth = None
+        img_left_depth = None
+        img_right_depth = None
+        if self.args.use_depth_image:
+            img_front_depth = self._peek_latest_image(self.front_depth_image_queue)
+            img_left_depth = self._peek_latest_image(self.left_depth_image_queue)
+            img_right_depth = self._peek_latest_image(self.right_depth_image_queue)
 
         return (
             True,
@@ -586,6 +643,42 @@ def get_ros_observation(args, ros_operator):
         if not success:
             if print_flag:
                 print(f"syn fail when get_ros_observation: {frame_or_error}")
+                print_flag = False
+            rate.sleep()
+            continue
+        print_flag = True
+        (
+            img_front,
+            img_left,
+            img_right,
+            img_front_depth,
+            img_left_depth,
+            img_right_depth,
+            puppet_arm_left,
+            puppet_arm_right,
+            puppet_arm_left_pose,
+            puppet_arm_right_pose,
+        ) = frame_or_error
+        return (
+            img_front,
+            img_left,
+            img_right,
+            puppet_arm_left,
+            puppet_arm_right,
+            puppet_arm_left_pose,
+            puppet_arm_right_pose,
+        )
+
+
+def get_latest_ros_observation(args, ros_operator):
+    rate = rospy.Rate(args.publish_rate)
+    print_flag = True
+
+    while not rospy.is_shutdown():
+        success, frame_or_error = ros_operator.get_latest_inference_frame()
+        if not success:
+            if print_flag:
+                print(f"latest obs unavailable: {frame_or_error}")
                 print_flag = False
             rate.sleep()
             continue

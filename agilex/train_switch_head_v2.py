@@ -1,36 +1,38 @@
 """
-Train a dual-head regressor that predicts Robometer progress and success jointly.
+Switch-head v2: temporal-attention variant of the dual-head (progress + success)
+soft-label regressor.
 
-The backbone/feature path is identical to `train_switch_head_robometer.py`
-(DINOv2 × 3 cameras + proprio state); only the final head becomes a 2-D output
-and the loss is BCE-with-logits on both targets (progress, success).
+Differences vs. `train_switch_head_dual.py`:
+  * DINOv2 per-frame CLS tokens across the 3 cameras and 20-frame clip are
+    aggregated by a small Temporal Transformer (learnable CLS pooling) instead
+    of a plain `mean(dim=1)` over frames.
+  * Per-camera and per-time position embeddings preserve view/order.
+  * Output still = 2 soft-label logits: (progress, success). Loss is BCE with
+    the packed teacher targets `progress_score`, `success_prob`.
 
-At inference you can combine the two scores however you like, e.g.:
-    rescue_prob = 1 − 0.5·(sigmoid(logit_p) + sigmoid(logit_s))
-without re-training.
+Data format is identical to existing packed switch-label datasets, so no
+re-packing is required:
+    <data_dir>/rollout_*/step_*.npz   with {top,right,left}_clip + state +
+                                      progress_score + success_prob
 
 Usage
 -----
-    python train_switch_head_dual.py \
-        --data_dir ../data/agilex_switch_labels_pnp_cup_0415 \
+    python train_switch_head_v2.py \
+        --data_dir ../data/agilex_switch_labels_plug_merged \
         --val_ratio 0.1 \
-        --wandb_project switch_head \
-        --wandb_run_name switch_head_dual_0418
+        --wandb_project switch_head --wandb_run_name switch_head_v2_0419
 """
 
 import argparse
-import glob
 import logging
-import os
 import pathlib
 
-import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 try:
@@ -43,93 +45,36 @@ from train_switch_head_robometer import (
     _setup_distributed,
     _cleanup_distributed,
 )
+from train_switch_head_dual import AgilexDualLabelDataset, _split_by_rollout
 
 
-class AgilexDualLabelDataset(Dataset):
-    """Returns (images, state, [progress, success]) per packed .npz step."""
+class DINOv2TemporalSwitchHead(nn.Module):
+    """
+    3-camera × T-frame DINOv2 features → Temporal Transformer → (progress, success) logits.
 
-    IMAGE_KEYS = ["top", "right", "left"]
+    Token layout per sample (B, 1 + C*T, D):
+        [CLS] [cam0_t0, cam0_t1, ..., cam0_{T-1}, cam1_t0, ..., cam2_{T-1}]
 
-    def __init__(
-        self,
-        data_dir: str,
-        use_clip: bool = True,
-        files: list | None = None,
-    ):
-        if files is not None:
-            self.files = sorted(files)
-        else:
-            self.files = sorted(glob.glob(os.path.join(data_dir, "rollout_*", "step_*.npz")))
-        if not self.files:
-            raise FileNotFoundError(f"No .npz files found in {data_dir}")
-
-        first = np.load(self.files[0], allow_pickle=True)
-        if "progress_score" not in first or "success_prob" not in first:
-            raise KeyError(
-                "Packed .npz must contain 'progress_score' and 'success_prob'. "
-                "Re-pack with train_switch_head_robometer.py pack ..."
-            )
-        self.state_dim = first["state"].shape[0]
-        self.use_clip = use_clip and all(f"{k}_clip" in first for k in self.IMAGE_KEYS)
-
-        valid = []
-        p_vals, s_vals = [], []
-        for f in self.files:
-            try:
-                d = np.load(f)
-                p_vals.append(float(d["progress_score"]))
-                s_vals.append(float(d["success_prob"]))
-                valid.append(f)
-            except Exception:
-                logging.warning(f"  Skipping corrupt file: {f}")
-        self.files = valid
-        logging.info(
-            f"  Dual-head dataset: {len(valid)} samples | "
-            f"progress μ={np.mean(p_vals):.3f} σ={np.std(p_vals):.3f} | "
-            f"success μ={np.mean(s_vals):.3f} σ={np.std(s_vals):.3f} | "
-            f"clip={self.use_clip}"
-        )
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        data = np.load(self.files[idx], allow_pickle=True)
-
-        images = []
-        for key in self.IMAGE_KEYS:
-            if self.use_clip and f"{key}_clip" in data:
-                clip = torch.from_numpy(
-                    data[f"{key}_clip"].copy()
-                ).permute(0, 3, 1, 2).float() / 255.0
-                images.append(clip)
-            else:
-                img = torch.from_numpy(
-                    data[key].copy()
-                ).permute(2, 0, 1).float() / 255.0
-                images.append(img)
-
-        state = torch.from_numpy(data["state"].astype(np.float32))
-        label = torch.tensor(
-            [float(data["progress_score"]), float(data["success_prob"])],
-            dtype=torch.float32,
-        )
-        return images, state, label
-
-
-class DINOv2DualHead(nn.Module):
-    """DINOv2 × 3-camera feature extractor with two regression heads (progress, success)."""
+    Both a per-camera and a per-time embedding are added; the learnable CLS
+    output is concatenated with proprio state and fed to a small MLP trunk.
+    """
 
     def __init__(
         self,
         dinov2_model: str = "dinov2_vitb14",
-        hidden_dim: int = 256,
         state_dim: int = 14,
         num_cameras: int = 3,
+        max_clip_frames: int = 20,
+        attn_dim: int = 384,
+        attn_heads: int = 4,
+        attn_layers: int = 2,
+        hidden_dim: int = 256,
+        dropout: float = 0.1,
         freeze_backbone: bool = True,
     ):
         super().__init__()
         self.num_cameras = num_cameras
+        self.max_clip_frames = max_clip_frames
 
         self.backbone = torch.hub.load("facebookresearch/dinov2", dinov2_model)
         self.feature_dim = self.backbone.embed_dim
@@ -146,71 +91,87 @@ class DINOv2DualHead(nn.Module):
             "img_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         )
 
-        input_dim = num_cameras * self.feature_dim + state_dim
+        self.feat_proj = nn.Linear(self.feature_dim, attn_dim)
+
+        self.cam_emb = nn.Parameter(torch.zeros(num_cameras, attn_dim))
+        self.time_emb = nn.Parameter(torch.zeros(max_clip_frames, attn_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, attn_dim))
+        nn.init.trunc_normal_(self.cam_emb, std=0.02)
+        nn.init.trunc_normal_(self.time_emb, std=0.02)
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=attn_dim,
+            nhead=attn_heads,
+            dim_feedforward=attn_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.temporal_attn = nn.TransformerEncoder(encoder_layer, num_layers=attn_layers)
+
+        trunk_in = attn_dim + state_dim
         self.trunk = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, hidden_dim),
+            nn.LayerNorm(trunk_in),
+            nn.Linear(trunk_in, hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(0.1),
+            nn.Dropout(dropout),
         )
-        self.head = nn.Linear(hidden_dim, 2)  # [progress_logit, success_logit]
+        self.head = nn.Linear(hidden_dim, 2)  # (progress_logit, success_logit)
 
-    def _encode_image(self, img: torch.Tensor) -> torch.Tensor:
-        if img.dim() == 5:
-            B, T, C, H, W = img.shape
-            img_flat = img.reshape(B * T, C, H, W)
-        else:
-            img_flat = img
-            B = img.shape[0]
-            T = 1
-
-        img_flat = F.interpolate(img_flat, size=(224, 224), mode="bilinear", align_corners=False)
-        img_flat = (img_flat - self.img_mean) / self.img_std
-
+    def _encode_cam_clip(self, clip: torch.Tensor) -> torch.Tensor:
+        """
+        clip: (B, T, 3, H, W) or (B, 3, H, W) — returns (B, T, feature_dim).
+        """
+        if clip.dim() == 4:
+            clip = clip.unsqueeze(1)
+        B, T, C, H, W = clip.shape
+        flat = clip.reshape(B * T, C, H, W)
+        flat = F.interpolate(flat, size=(224, 224), mode="bilinear", align_corners=False)
+        flat = (flat - self.img_mean) / self.img_std
         if self.freeze_backbone:
             with torch.no_grad():
-                feat_flat = self.backbone(img_flat)
+                feat = self.backbone(flat)
         else:
-            feat_flat = self.backbone(img_flat)
-
-        if T > 1:
-            return feat_flat.view(B, T, -1).mean(dim=1)
-        return feat_flat
+            feat = self.backbone(flat)
+        return feat.view(B, T, -1)
 
     def forward(self, images: list[torch.Tensor], state: torch.Tensor) -> torch.Tensor:
-        feats = [self._encode_image(img) for img in images]
-        combined = torch.cat(feats + [state], dim=-1)
-        return self.head(self.trunk(combined))  # (B, 2) logits
+        """
+        images: list length num_cameras of tensors (B, T, 3, H, W) or (B, 3, H, W)
+        state:  (B, state_dim)
+        returns: (B, 2) logits — [progress, success]
+        """
+        cam_tokens = []
+        for c, img in enumerate(images):
+            feat = self._encode_cam_clip(img)           # (B, T, feature_dim)
+            feat = self.feat_proj(feat)                 # (B, T, attn_dim)
+            T = feat.shape[1]
+            if T > self.max_clip_frames:
+                raise ValueError(
+                    f"clip length {T} exceeds max_clip_frames {self.max_clip_frames}"
+                )
+            feat = feat + self.time_emb[:T].unsqueeze(0)
+            feat = feat + self.cam_emb[c].view(1, 1, -1)
+            cam_tokens.append(feat)
+
+        tokens = torch.cat(cam_tokens, dim=1)           # (B, C*T, attn_dim)
+        B = tokens.shape[0]
+        cls = self.cls_token.expand(B, -1, -1)          # (B, 1, attn_dim)
+        seq = torch.cat([cls, tokens], dim=1)           # (B, 1 + C*T, attn_dim)
+        seq = self.temporal_attn(seq)
+        pooled = seq[:, 0]
+
+        combined = torch.cat([pooled, state], dim=-1)
+        return self.head(self.trunk(combined))
 
     def predict(self, images, state):
-        """Returns (progress_hat, success_hat) in [0,1]."""
+        """Returns (progress, success) ∈ [0,1]."""
         return torch.sigmoid(self.forward(images, state))
-
-
-def _split_by_rollout(data_dir: str, val_ratio: float, seed: int):
-    import random
-    files = sorted(glob.glob(os.path.join(data_dir, "rollout_*", "step_*.npz")))
-    rollouts: dict[str, list[str]] = {}
-    for f in files:
-        rid = os.path.basename(os.path.dirname(f))
-        rollouts.setdefault(rid, []).append(f)
-    rollout_ids = sorted(rollouts.keys())
-    rng = random.Random(seed)
-    shuffled = rollout_ids[:]
-    rng.shuffle(shuffled)
-    n_val = max(1, int(round(len(shuffled) * val_ratio)))
-    val_ids = set(shuffled[:n_val])
-    train_files = [f for r in rollout_ids if r not in val_ids for f in rollouts[r]]
-    val_files = [f for r in rollout_ids if r in val_ids for f in rollouts[r]]
-    logging.info(
-        f"Split by rollout (seed={seed}): "
-        f"{len(rollout_ids) - n_val} train / {n_val} val rollouts "
-        f"({len(train_files)} / {len(val_files)} steps)"
-    )
-    return train_files, val_files
 
 
 def train(args):
@@ -222,24 +183,32 @@ def train(args):
         logging.info(f"Using device: {device}  (world_size={world_size})")
 
     if args.val_ratio > 0:
-        train_files, val_files = _split_by_rollout(args.data_dir, args.val_ratio, args.val_split_seed)
-        train_ds = AgilexDualLabelDataset(args.data_dir, use_clip=args.use_clip, files=train_files)
-        val_ds = AgilexDualLabelDataset(args.data_dir, use_clip=args.use_clip, files=val_files)
+        train_files, val_files = _split_by_rollout(
+            args.data_dir, args.val_ratio, args.val_split_seed
+        )
+        train_ds = AgilexDualLabelDataset(args.data_dir, use_clip=True, files=train_files)
+        val_ds = AgilexDualLabelDataset(args.data_dir, use_clip=True, files=val_files)
     else:
-        train_ds = AgilexDualLabelDataset(args.data_dir, use_clip=args.use_clip)
+        train_ds = AgilexDualLabelDataset(args.data_dir, use_clip=True)
         val_ds = None
 
     state_dim = train_ds.state_dim
-    model = DINOv2DualHead(
+    model = DINOv2TemporalSwitchHead(
         dinov2_model=args.dinov2_model,
-        hidden_dim=args.hidden_dim,
         state_dim=state_dim,
         num_cameras=3,
+        max_clip_frames=args.max_clip_frames,
+        attn_dim=args.attn_dim,
+        attn_heads=args.attn_heads,
+        attn_layers=args.attn_layers,
+        hidden_dim=args.hidden_dim,
+        dropout=args.dropout,
         freeze_backbone=args.freeze_backbone,
     ).to(device)
 
     if distributed:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=False)
     raw_model = model.module if distributed else model
 
     train_sampler = DistributedSampler(train_ds, shuffle=True) if distributed else None
@@ -259,11 +228,13 @@ def train(args):
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     if is_main:
-        logging.info(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
+        logging.info(
+            f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}"
+        )
 
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-    criterion = nn.BCEWithLogitsLoss()  # targets are already in [0,1]
+    criterion = nn.BCEWithLogitsLoss()
 
     output_dir = pathlib.Path(args.output_dir)
     if is_main:
@@ -276,7 +247,7 @@ def train(args):
         wandb.init(
             project=args.wandb_project,
             name=args.wandb_run_name,
-            config=vars(args) | {"world_size": world_size, "mode": "dual_head"},
+            config=vars(args) | {"world_size": world_size, "mode": "dual_head_v2"},
         )
 
     best_val = float("inf")
@@ -293,9 +264,9 @@ def train(args):
         for images, state, label in train_loader:
             images = [img.to(device) for img in images]
             state = state.to(device)
-            label = label.to(device)  # (B, 2)
+            label = label.to(device)  # (B, 2) = [progress, success]
 
-            logits = model(images, state)  # (B, 2)
+            logits = model(images, state)
             loss_p = criterion(logits[:, 0], label[:, 0])
             loss_s = criterion(logits[:, 1], label[:, 1])
             loss = args.progress_weight * loss_p + args.success_weight * loss_s
@@ -316,11 +287,9 @@ def train(args):
         scheduler.step()
 
         val_msg = "N/A"
+        avg_vl = vp = vs = mae_p = mae_s = vn = 0.0
         if val_loader is not None:
             model.eval()
-            vl = vp = vs = 0.0
-            vn = 0
-            mae_p = mae_s = 0.0
             with torch.no_grad():
                 for images, state, label in val_loader:
                     images = [img.to(device) for img in images]
@@ -331,16 +300,18 @@ def train(args):
                     ls = criterion(logits[:, 1], label[:, 1])
                     vp += lp.item()
                     vs += ls.item()
-                    vl += (args.progress_weight * lp + args.success_weight * ls).item()
+                    vl_step = args.progress_weight * lp + args.success_weight * ls
+                    avg_vl += vl_step.item()
                     pred = torch.sigmoid(logits)
                     mae_p += (pred[:, 0] - label[:, 0]).abs().mean().item()
                     mae_s += (pred[:, 1] - label[:, 1]).abs().mean().item()
                     vn += 1
-            avg_vl = vl / max(vn, 1)
+            vn = max(vn, 1)
+            avg_vl /= vn
             val_msg = (
                 f"loss={avg_vl:.4f} "
-                f"p_bce={vp/max(vn,1):.4f} s_bce={vs/max(vn,1):.4f} "
-                f"p_mae={mae_p/max(vn,1):.4f} s_mae={mae_s/max(vn,1):.4f}"
+                f"p_bce={vp/vn:.4f} s_bce={vs/vn:.4f} "
+                f"p_mae={mae_p/vn:.4f} s_mae={mae_s/vn:.4f}"
             )
             if is_main and avg_vl < best_val:
                 best_val = avg_vl
@@ -363,10 +334,10 @@ def train(args):
             if val_loader is not None:
                 log.update({
                     "val/loss": avg_vl,
-                    "val/progress_bce": vp / max(vn, 1),
-                    "val/success_bce": vs / max(vn, 1),
-                    "val/progress_mae": mae_p / max(vn, 1),
-                    "val/success_mae": mae_s / max(vn, 1),
+                    "val/progress_bce": vp / vn,
+                    "val/success_bce": vs / vn,
+                    "val/progress_mae": mae_p / vn,
+                    "val/success_mae": mae_s / vn,
                 })
             wandb.log(log, step=epoch + 1)
 
@@ -381,26 +352,31 @@ def train(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Dual-head regressor (progress + success)")
+    parser = argparse.ArgumentParser(
+        description="Temporal-attention switch head v2 (soft-label progress + success)"
+    )
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--val_ratio", type=float, default=0.1)
     parser.add_argument("--val_split_seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default=None,
-                        help="Checkpoint dir. If unset, defaults to checkpoints/switch_head_dual/<run_tag>, "
+                        help="Checkpoint dir. If unset, defaults to checkpoints/switch_head_v2/<run_tag>, "
                              "where run_tag is --wandb_run_name or the basename of --data_dir.")
     parser.add_argument("--dinov2_model", type=str, default="dinov2_vitb14",
                         choices=["dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"])
+    parser.add_argument("--max_clip_frames", type=int, default=20)
+    parser.add_argument("--attn_dim", type=int, default=384)
+    parser.add_argument("--attn_heads", type=int, default=4)
+    parser.add_argument("--attn_layers", type=int, default=2)
     parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--freeze_backbone", action="store_true", default=True)
     parser.add_argument("--no_freeze_backbone", dest="freeze_backbone", action="store_false")
-    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_every", type=int, default=5)
-    parser.add_argument("--use_clip", action="store_true", default=True)
-    parser.add_argument("--no_clip", dest="use_clip", action="store_false")
     parser.add_argument("--progress_weight", type=float, default=1.0)
     parser.add_argument("--success_weight", type=float, default=1.0)
     parser.add_argument("--wandb_project", type=str, default=None)
@@ -409,7 +385,7 @@ def main():
 
     if args.output_dir is None:
         run_tag = args.wandb_run_name or pathlib.Path(args.data_dir).name
-        args.output_dir = str(pathlib.Path("checkpoints/switch_head_dual") / run_tag)
+        args.output_dir = str(pathlib.Path("checkpoints/switch_head_v2") / run_tag)
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     train(args)

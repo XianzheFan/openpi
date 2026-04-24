@@ -219,7 +219,7 @@ def _dreamdojo_generate(host: str, port: int, frame_np: np.ndarray, actions: np.
     try:
         resp = requests.post(url, json=payload, timeout=600)
         resp.raise_for_status()
-        return resp.json()
+        return resp.json()["save_path"]
     except Exception as e:
         logging.error(f"[DreamDojo port={port}] generation failed: {e}")
         return None
