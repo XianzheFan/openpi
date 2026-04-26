@@ -69,8 +69,8 @@ class Pi0SDEConfig(pi0_config.Pi0Config):
     noise_method: str = "flow_sde"
     # noise_level: float = 0.5 # (libero_spatial, libero_10)
     noise_level: float = 0.3 # (libero_object, libero_goal)
-    # num_steps: int = 5  # denoise steps (libero_object, libero_goal, libero_10)
-    num_steps: int = 3  # denoise steps (libero_spatial)
+    # num_steps: int = 3  # denoise steps (libero_spatial)
+    num_steps: int = 5  # denoise steps (libero_object, libero_goal, libero_10)
     
     @property
     @override

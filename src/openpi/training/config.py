@@ -1081,7 +1081,7 @@ _CONFIGS = [
             repo_id="spray_cap",
             base_config=DataConfig(
                 local_dirs=[
-                    "data/spray_cap_merged",
+                    "data/spray_cap_truncated",
                 ],
             ),
             assets=AssetsConfig(

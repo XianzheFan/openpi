@@ -1,6 +1,6 @@
 """
 Agilex robot inference (SYNC): DINOv2 Dual-Head (progress + success) +
-threshold-based rescue + SDE + DreamDojo + DINOv2 Value Expert.
+threshold-based rescue + SDE + DreamDojo.
 
 Unlike agilex_infer_dinov2_value_switch.py (which uses a binary switch-head
 classifier), this version:
@@ -22,9 +22,9 @@ classifier), this version:
       4. (default off) expected_progress_rate > 0 AND progress < expected × 0.5
          AND time_fraction > 0.3
 
-  * On rescue trigger, runs the SDE-policy + DreamDojo + DINOv2 Value Expert
-    selection pipeline (shared with the switch-head version) and overwrites
-    the current action chunk.
+  * On rescue trigger, runs the SDE-policy + DreamDojo selection pipeline
+    (DreamDojo server scores each candidate) and overwrites the current
+    action chunk.
 
 Usage
 -----
@@ -43,7 +43,6 @@ Usage
       --task towel --host 10.0.0.1 --port 8000 \\
       --sde_host 10.0.0.1 --sde_port 8001 \\
       --dual_head_ckpt checkpoints/switch_head_dual/best_model.pt \\
-      --value_expert_ckpt checkpoints/dinov2_value_expert/best_model.pt \\
       --num_sde_samples 5 --dd_base_port 8020 \\
       --rescue_check_interval_sec 1.0 \\
       --progress_threshold 0.25 --progress_drop 0.04 --success_threshold 0.6
@@ -71,12 +70,16 @@ import torch
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from clients import OpenpiClient
-from agilex_utils import check_keyboard_input, get_config, handle_interactive_mode, process_action
+from agilex_utils import (
+    drain_keyboard_events,
+    get_config,
+    handle_interactive_mode,
+    process_action,
+)
 from ros_operator import RosOperator, get_ros_observation
 from agilex_infer_dinov2_value_switch import (
     ROLLOUT_FPS,
     SwitchClipBuffer,
-    ValueExpertScorer,
     _dreamdojo_generate,
 )
 
@@ -217,6 +220,84 @@ class RescueThresholdChecker:
                 reasons.append("cond4_behind_expected")
 
         return bool(reasons), reasons, info
+
+
+DAGGER_KEYS = {
+    # arrow keys (may not work on all terminals — DECCKM application mode etc.)
+    "UP", "DOWN", "LEFT", "RIGHT",
+    # letter fallbacks: IJKL drives x/y, u/d drives z, r releases
+    "i", "k", "j", "l",
+    "u", "d",
+    "r",
+}
+
+
+class DaggerController:
+    """Tracks human teleop overrides on the active arm's EEF position.
+
+    On the first DAgger keypress of an episode (or the first one after an 'r'
+    release), we snapshot the current eef_pose as ``base_eef``. Subsequent
+    arrow / u / d presses accumulate a (dx, dy, dz) offset, which we add to
+    the active arm's xyz at publish time. The non-active arm is held at its
+    snapshot pose so the policy doesn't fight the human.
+    """
+
+    def __init__(self, step_xyz: float, arm: str):
+        self.step_xyz = float(step_xyz)
+        self.arm = arm  # 'right' or 'left'
+        self.active = False
+        self.base_eef: np.ndarray | None = None
+        self.offset = np.zeros(3, dtype=np.float64)
+        self.events_since_start = 0
+
+    def reset(self):
+        self.active = False
+        self.base_eef = None
+        self.offset = np.zeros(3, dtype=np.float64)
+        self.events_since_start = 0
+
+    def begin(self, base_eef: np.ndarray):
+        self.active = True
+        self.base_eef = np.asarray(base_eef, dtype=np.float64).copy()
+        self.offset = np.zeros(3, dtype=np.float64)
+        self.events_since_start = 0
+
+    def apply(self, key: str) -> bool:
+        """Update offset based on key. Returns True if the key was consumed.
+
+        Layout:
+          i / k  → x +/-   (arrow ↑ / ↓ also map here)
+          j / l  → y +/-   (arrow ← / → also map here)
+          u / d  → z +/-
+          r      → release
+        """
+        if key in ("UP", "i"):
+            self.offset[0] += self.step_xyz
+        elif key in ("DOWN", "k"):
+            self.offset[0] -= self.step_xyz
+        elif key in ("LEFT", "j"):
+            self.offset[1] += self.step_xyz
+        elif key in ("RIGHT", "l"):
+            self.offset[1] -= self.step_xyz
+        elif key == "u":
+            self.offset[2] += self.step_xyz
+        elif key == "d":
+            self.offset[2] -= self.step_xyz
+        elif key == "r":
+            self.reset()
+            return True
+        else:
+            return False
+        self.events_since_start += 1
+        return True
+
+    def target_eef(self) -> np.ndarray:
+        if self.base_eef is None:
+            raise RuntimeError("DaggerController.target_eef() called before begin()")
+        target = self.base_eef.copy()
+        slc = slice(7, 10) if self.arm == "right" else slice(0, 3)
+        target[slc] = self.base_eef[slc] + self.offset
+        return target
 
 
 def _on_sigint(signum, frame):
@@ -407,6 +488,15 @@ def _select_best_action_with_prefix(
         "best_score": candidate_scores.get(best_idx, float("inf")),
         "prefix_skip_steps": skip,
     }
+    # Stash the full SDE candidate set so the caller can save all of them
+    # (not just the winning one). Each entry is the action chunk truncated
+    # to ``exec_horizon`` so it lines up with what DreamDojo actually saw.
+    selection_record["all_candidates"] = [
+        np.asarray(ch[:exec_horizon], dtype=np.float32) for ch in action_chunks
+    ]
+    selection_record["all_candidate_scores"] = [
+        candidate_scores.get(i, None) for i in range(num_samples)
+    ]
     logging.info(
         f"[Dual] Selected candidate {best_idx} "
         f"(score={candidate_scores.get(best_idx, 'N/A')}, prefix_skip={skip})"
@@ -431,21 +521,6 @@ def model_inference(args, config, ros_operator):
             sde_policy = OpenpiClient(host=args.sde_host, port=args.sde_port)
             logging.info(f"SDE policy connected to {args.sde_host}:{args.sde_port}")
 
-    # DINOv2 value expert
-    value_scorer = None
-    if args.value_expert_ckpt and os.path.exists(args.value_expert_ckpt):
-        value_scorer = ValueExpertScorer(
-            checkpoint_path=args.value_expert_ckpt,
-            num_clip_frames=args.num_clip_frames,
-            dinov2_model=args.dinov2_model,
-            attn_heads=args.attn_heads,
-            attn_layers=args.attn_layers,
-            hidden_dim=args.value_hidden_dim,
-        )
-        logging.info(f"DINOv2 value expert loaded from {args.value_expert_ckpt}")
-    elif args.value_expert_ckpt:
-        logging.warning(f"Value expert checkpoint not found: {args.value_expert_ckpt}")
-
     # Dual head (progress + success)
     if not args.dual_head_ckpt or not os.path.exists(args.dual_head_ckpt):
         raise FileNotFoundError(
@@ -463,11 +538,11 @@ def model_inference(args, config, ros_operator):
         f"(use_clip={args.dual_head_use_clip}, clip_len={args.dual_head_clip_len})"
     )
 
-    can_switch = sde_policy is not None and value_scorer is not None
+    can_switch = sde_policy is not None
     if not can_switch:
         logging.warning(
-            "SDE policy or value expert missing; dual head will still report "
-            "scores but rescue actions will not be executed."
+            "SDE policy missing; dual head will still report scores but "
+            "rescue actions will not be executed."
         )
 
     max_publish_step = config["episode_len"]
@@ -534,6 +609,7 @@ def model_inference(args, config, ros_operator):
 
             action_buffer = np.zeros([chunk_size, config["state_dim"]])
             action_buffer_base_t = -chunk_size  # forces ODE replan on first step
+            action_buffer_source = "ode"
             last_rescue_check_t = -rescue_check_stride
             last_rescue_trigger_t = -10 ** 9
             last_published_action: np.ndarray | None = None
@@ -546,21 +622,53 @@ def model_inference(args, config, ros_operator):
             user_stopped = False
             t = 0
 
+            dagger = (
+                DaggerController(args.dagger_step_xyz, args.dagger_arm)
+                if args.dagger_mode else None
+            )
+            dagger_log: list = []
+            sde_chunk_log: list = []  # (t_start, source, chunk array)
+
+            # ---- Rescue execution mode:
+            #      * dagger_mode=True  → ASYNC (worker thread). Publish loop
+            #        stays responsive so the operator can take over with
+            #        keys while DreamDojo is computing.
+            #      * dagger_mode=False → SYNC (blocking call). Arm pauses
+            #        while DreamDojo scores the candidates, then injects on
+            #        the same iteration. Default.
+            rescue_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="rescue",
+            )
+            pending_rescue: dict | None = None
+            # Hold window after pressing 's': keeps the arm at the action
+            # that was being published when the rescue was submitted, so the
+            # operator has a few seconds to react and (optionally) take over
+            # with DAgger keys before the SDE chunk gets injected.
+            s_hold_until_t = -1
+            s_hold_action: np.ndarray | None = None
+            s_hold_steps = max(0, int(round(args.s_hold_seconds * args.publish_rate)))
+
             while t < max_publish_step and not rospy.is_shutdown() and not shutdown_event.is_set():
                 manual_rescue_pressed = False
-                key = check_keyboard_input()
-                if key == " ":
-                    result = handle_interactive_mode(task_time)
-                    if result == "reset":
-                        ros_operator.puppet_arm_publish_continuous(left0, right0)
-                        user_stopped = True
-                        break
-                    elif result == "quit":
-                        user_stopped = True
-                        return
-                elif key == "s":
-                    manual_rescue_pressed = True
-                    print("\n\033[93m>>> [System] Key 's' detected! Manually triggering SDE + DreamDojo rescue mechanism!\033[0m", flush=True)
+                dagger_keys: list = []
+                events = drain_keyboard_events()
+                for key in events:
+                    if key == " ":
+                        result = handle_interactive_mode(task_time)
+                        if result == "reset":
+                            ros_operator.puppet_arm_publish_continuous(left0, right0)
+                            user_stopped = True
+                            break
+                        elif result == "quit":
+                            user_stopped = True
+                            return
+                    elif key == "s":
+                        manual_rescue_pressed = True
+                        print("\n\033[93m>>> [System] Key 's' detected! Manually triggering SDE + DreamDojo rescue mechanism!\033[0m", flush=True)
+                    elif args.dagger_mode and key in DAGGER_KEYS:
+                        dagger_keys.append(key)
+                if user_stopped:
+                    break
 
                 # Capture current frame for rollout video + clip buffer.
                 front_msg = (
@@ -603,13 +711,39 @@ def model_inference(args, config, ros_operator):
                             clip_buffer.update(front_img, right_img, left_img)
 
                 # ----- Rescue check at fixed interval (independent of chunk boundary) -----
+                # While the human is in DAgger override, skip rescue entirely:
+                # we don't want to bother dual-head / DreamDojo while the
+                # operator is steering the arm. We also skip while a previous
+                # rescue is still in-flight on the worker thread — only one
+                # outstanding submission at a time.
                 rescue_triggered = False
+                dagger_engaged = dagger is not None and dagger.active
+                rescue_in_flight = (
+                    pending_rescue is not None
+                    and not pending_rescue["future"].done()
+                )
                 should_check_auto = (
                     can_switch
+                    and not dagger_engaged
+                    and not rescue_in_flight
                     and frame_counter > 0
                     and (t - last_rescue_check_t) >= rescue_check_stride
                     and (t - last_rescue_trigger_t) >= rescue_cooldown_steps
                 )
+                if dagger_engaged and manual_rescue_pressed:
+                    print(
+                        "\n\033[96m>>> [DAgger] 's' ignored — release with 'r' "
+                        "to re-enable rescue.\033[0m",
+                        flush=True,
+                    )
+                    manual_rescue_pressed = False
+                if rescue_in_flight and manual_rescue_pressed:
+                    print(
+                        "\n\033[93m>>> [Rescue] DreamDojo still running from a "
+                        "previous trigger — 's' ignored.\033[0m",
+                        flush=True,
+                    )
+                    manual_rescue_pressed = False
 
                 if can_switch and (should_check_auto or manual_rescue_pressed):
                     if should_check_auto:
@@ -678,57 +812,152 @@ def model_inference(args, config, ros_operator):
                     )
 
                     if triggered:
-                        rescue_active_until_frame = frame_counter + chunk_size - 1
                         step_save_dir = rollout_dir / "rescue_steps" / f"t{t}_f{frame_counter}"
-
                         reasons_str = ",".join(reasons)
                         print(f"\n\033[93m>>> [System] Rescue Triggered (Progress: {progress_p:.3f}, Success: {success_p:.3f})!\033[0m", flush=True)
                         print(f"\033[93m>>> [System] Reasons: {reasons_str}\033[0m", flush=True)
-                        print(f"\033[93m>>> [System] Waiting for DreamDojo to generate {args.num_sde_samples} candidate videos and Value Expert to score them. Please wait... <<<\033[0m\n", flush=True)
+                        if args.dagger_mode:
+                            print(f"\033[93m>>> [System] DreamDojo running ASYNC ({args.num_sde_samples} candidates). Arm stays responsive — chunk will inject when ready.\033[0m\n", flush=True)
+                            future = rescue_executor.submit(
+                                _select_best_action_with_prefix,
+                                obs_snapshot=obs_snapshot,
+                                sde_policy=sde_policy,
+                                exec_horizon=chunk_size,
+                                task_description=task_description,
+                                step_save_dir=step_save_dir,
+                                dd_host=args.dd_host,
+                                dd_base_port=args.dd_base_port,
+                                num_samples=args.num_sde_samples,
+                                prefix_action=last_published_action,
+                                skip_steps=args.rescue_skip_sde_steps,
+                            )
+                        else:
+                            print(f"\033[93m>>> [System] DreamDojo running SYNC ({args.num_sde_samples} candidates). Arm pausing until candidates scored...\033[0m\n", flush=True)
+                            future = concurrent.futures.Future()
+                            try:
+                                _sync_result = _select_best_action_with_prefix(
+                                    obs_snapshot=obs_snapshot,
+                                    sde_policy=sde_policy,
+                                    exec_horizon=chunk_size,
+                                    task_description=task_description,
+                                    step_save_dir=step_save_dir,
+                                    dd_host=args.dd_host,
+                                    dd_base_port=args.dd_base_port,
+                                    num_samples=args.num_sde_samples,
+                                    prefix_action=last_published_action,
+                                    skip_steps=args.rescue_skip_sde_steps,
+                                )
+                                future.set_result(_sync_result)
+                            except Exception as _sync_err:
+                                future.set_exception(_sync_err)
+                        pending_rescue = {
+                            "future": future,
+                            "t_submit": t,
+                            "frame_submit": frame_counter,
+                            "progress": float(progress_p),
+                            "success": float(success_p),
+                            "reasons": list(reasons),
+                        }
+                        # Cooldown is gated from submission time so we don't
+                        # double-submit while DreamDojo is still working.
+                        last_rescue_trigger_t = t
 
-                        best_actions, sel_record = _select_best_action_with_prefix(
-                            obs_snapshot=obs_snapshot,
-                            sde_policy=sde_policy,
-                            exec_horizon=chunk_size,
-                            task_description=task_description,
-                            step_save_dir=step_save_dir,
-                            dd_host=args.dd_host,
-                            dd_base_port=args.dd_base_port,
-                            num_samples=args.num_sde_samples,
-                            prefix_action=last_published_action,
-                            skip_steps=args.rescue_skip_sde_steps,
-                        )
+                        # s-hold only matters in dagger_mode (async). It
+                        # freezes the arm so the operator has time to take
+                        # over with keys while DreamDojo is computing. In
+                        # sync mode the arm already paused during the call
+                        # so there's nothing to hold.
+                        if (
+                            args.dagger_mode
+                            and manual_rescue_pressed
+                            and s_hold_steps > 0
+                            and last_published_action is not None
+                        ):
+                            s_hold_until_t = t + s_hold_steps
+                            s_hold_action = np.asarray(last_published_action).copy()
+                            print(
+                                f"\033[93m>>> [System] Arm holding for "
+                                f"~{args.s_hold_seconds:.1f}s — press i/k/j/l/u/d "
+                                f"now to take over.\033[0m",
+                                flush=True,
+                            )
 
+                # ----- Drain a completed background rescue (sync injection) -----
+                in_s_hold = t < s_hold_until_t and not (dagger is not None and dagger.active)
+                if (
+                    pending_rescue is not None
+                    and pending_rescue["future"].done()
+                    and not (dagger is not None and dagger.active)
+                    and not in_s_hold
+                ):
+                    pr = pending_rescue
+                    pending_rescue = None
+                    try:
+                        best_actions, sel_record = pr["future"].result()
+                    except Exception as e:
+                        logging.error(f"[Rescue] async DreamDojo failed: {e}")
+                        best_actions, sel_record = None, None
+
+                    if best_actions is not None and sel_record is not None:
                         best_score = sel_record.get('best_score', 'N/A')
                         if isinstance(best_score, float):
                             best_score_str = f"{best_score:.4f}"
                         else:
                             best_score_str = str(best_score)
-                        print(f"\n\033[92m>>> [System] Evaluation complete! Selected optimal action sequence (Candidate ID: {sel_record.get('best_idx')}, Score: {best_score_str})\033[0m", flush=True)
-                        print(f"\033[92m>>> [System] Injecting actions into buffer. Robot resuming execution! <<<\033[0m\n", flush=True)
-                        
-                        sel_record["t"] = t
-                        sel_record["frame"] = frame_counter
-                        sel_record["progress"] = progress_p
-                        sel_record["success"] = success_p
-                        sel_record["reasons"] = reasons
-                        value_selections.append(sel_record)
+                        wait_steps = t - pr["t_submit"]
+                        print(
+                            f"\n\033[92m>>> [System] DreamDojo done after "
+                            f"{wait_steps} publish steps "
+                            f"(best_idx={sel_record.get('best_idx')}, "
+                            f"score={best_score_str}). Injecting now.\033[0m\n",
+                            flush=True,
+                        )
+
+                        sel_record["t"] = int(t)
+                        sel_record["frame"] = int(frame_counter)
+                        sel_record["t_submit"] = int(pr["t_submit"])
+                        sel_record["frame_submit"] = int(pr["frame_submit"])
+                        sel_record["progress"] = pr["progress"]
+                        sel_record["success"] = pr["success"]
+                        sel_record["reasons"] = pr["reasons"]
+                        json_safe_sel = {
+                            k: v for k, v in sel_record.items()
+                            if k not in ("all_candidates",)
+                        }
+                        value_selections.append(json_safe_sel)
 
                         rescue_log.append({
-                            "t": t,
-                            "frame": frame_counter,
-                            "progress": progress_p,
-                            "success": success_p,
-                            "reasons": reasons,
+                            "t": int(t),
+                            "frame": int(frame_counter),
+                            "t_submit": int(pr["t_submit"]),
+                            "progress": pr["progress"],
+                            "success": pr["success"],
+                            "reasons": pr["reasons"],
                         })
 
+                        best_actions = np.asarray(best_actions)
                         L = min(best_actions.shape[0], chunk_size)
                         action_buffer = np.zeros_like(action_buffer)
-                        best_actions = np.asarray(best_actions, dtype=action_buffer.dtype)
+                        best_actions = best_actions.astype(action_buffer.dtype, copy=False)
                         K = int(max(0, args.rescue_blend_steps))
-                        if K > 0 and last_published_action is not None and L > 0:
-                            offset = last_published_action.astype(action_buffer.dtype) - best_actions[0]
-                            ramp = np.maximum(0.0, 1.0 - np.arange(L, dtype=np.float64) / float(K))
+                        # Blending only makes sense when the most recent
+                        # publish was a joint/eef action of the same shape;
+                        # during/after DAgger that may be an EEF pose with
+                        # different semantics, so guard the shape match.
+                        can_blend = (
+                            K > 0
+                            and last_published_action is not None
+                            and L > 0
+                            and last_published_action.shape == best_actions[0].shape
+                        )
+                        if can_blend:
+                            offset = (
+                                last_published_action.astype(action_buffer.dtype)
+                                - best_actions[0]
+                            )
+                            ramp = np.maximum(
+                                0.0, 1.0 - np.arange(L, dtype=np.float64) / float(K)
+                            )
                             action_buffer[:L] = best_actions[:L] + offset[None, :] * ramp[:, None]
                             max_jump = float(np.max(np.abs(action_buffer[0] - last_published_action)))
                             logging.info(
@@ -738,12 +967,39 @@ def model_inference(args, config, ros_operator):
                         else:
                             action_buffer[:L] = best_actions[:L]
                         action_buffer_base_t = t
-                        last_rescue_trigger_t = t
+                        action_buffer_source = "sde"
+                        rescue_active_until_frame = frame_counter + chunk_size - 1
+                        sde_chunk_log.append({
+                            "t_start": int(t),
+                            "frame_start": int(frame_counter),
+                            "actions": np.asarray(action_buffer[:L]).copy(),
+                            "best_idx": int(sel_record.get("best_idx", -1)),
+                            "best_score": sel_record.get("best_score", None),
+                            "all_candidates": [
+                                np.asarray(c, dtype=np.float32)
+                                for c in sel_record.get("all_candidates", [])
+                            ],
+                            "all_candidate_scores": list(
+                                sel_record.get("all_candidate_scores", [])
+                            ),
+                            "reasons": list(pr["reasons"]),
+                            "progress": float(pr["progress"]),
+                            "success": float(pr["success"]),
+                        })
                         rescue_triggered = True
-                        logging.info(f"[Rescue] Injected {L} SDE actions at t={t}")
+                        logging.info(
+                            f"[Rescue] Injected {L} SDE actions at t={t} "
+                            f"(submitted at t={pr['t_submit']})"
+                        )
 
                 # ----- ODE replan when action buffer exhausted (and no rescue just fired) -----
-                if not rescue_triggered and (t - action_buffer_base_t) >= chunk_size:
+                # Skip the replan during the s-hold window so the hold pose
+                # isn't immediately overwritten by a fresh ODE chunk.
+                if (
+                    not rescue_triggered
+                    and not in_s_hold
+                    and (t - action_buffer_base_t) >= chunk_size
+                ):
                     actions = inference_fn_sync(args, config, policy, ros_operator)
                     assert actions is not None, "Sync inference returned None"
                     assert actions.shape[0] >= chunk_size, (
@@ -751,23 +1007,106 @@ def model_inference(args, config, ros_operator):
                     )
                     action_buffer = actions[:chunk_size]
                     action_buffer_base_t = t
+                    action_buffer_source = "ode"
 
-                # ----- Execute action from buffer -----
+                # ----- Optional DAgger: drive the EEF from the keyboard -----
+                dagger_override_used = False
+                if dagger is not None:
+                    if dagger_keys and not dagger.active:
+                        # Snapshot a fresh observation so the user starts from
+                        # the live arm pose, not a stale rescue-time snapshot.
+                        update_observation_window(args, config, ros_operator)
+                        with observation_window_lock:
+                            base_eef = np.asarray(
+                                observation_window[-1]["eef_pose"], dtype=np.float64
+                            ).copy()
+                        dagger.begin(base_eef)
+                        # If the operator started DAgger inside an s-hold
+                        # window, cancel the hold so the arm doesn't snap
+                        # back to the pre-DAgger snapshot after release.
+                        s_hold_until_t = -1
+                        s_hold_action = None
+                        print(
+                            f"\n\033[96m>>> [DAgger] Manual EEF override engaged on '{dagger.arm}' arm. "
+                            f"Keys: i/k = x+/x-, j/l = y+/y-, u/d = z+/z- "
+                            f"(arrow keys also work if terminal supports them); "
+                            f"'r' to release.\033[0m",
+                            flush=True,
+                        )
+                    consumed_release = False
+                    for k in dagger_keys:
+                        if not dagger.active:
+                            # 'r' before begin() is a no-op; arrows fall through
+                            continue
+                        if k == "r":
+                            consumed_release = True
+                        dagger.apply(k)
+                        print(
+                            f"\033[96m[DAgger] key={k} offset="
+                            f"({dagger.offset[0]:+.3f}, {dagger.offset[1]:+.3f}, "
+                            f"{dagger.offset[2]:+.3f})\033[0m",
+                            flush=True,
+                        )
+                    if consumed_release:
+                        print(
+                            "\n\033[96m>>> [DAgger] Released. Resuming policy actions.\033[0m",
+                            flush=True,
+                        )
+
+                # ----- Execute action from buffer (or DAgger override) -----
+                # Re-evaluate the hold flag in case DAgger started this iter,
+                # in which case we want the user to drive instead of holding.
+                in_s_hold = (
+                    t < s_hold_until_t
+                    and not (dagger is not None and dagger.active)
+                )
                 idx_in_chunk = t - action_buffer_base_t
                 idx_in_chunk = max(0, min(idx_in_chunk, chunk_size - 1))
-                act = action_buffer[idx_in_chunk]
+                if in_s_hold and s_hold_action is not None:
+                    act = np.asarray(s_hold_action).copy()
+                else:
+                    act = action_buffer[idx_in_chunk]
 
-                if args.ctrl_type == "joint":
+                if dagger is not None and dagger.active:
+                    target_eef = dagger.target_eef()
+                    left_action, right_action = process_action(config["task"], target_eef)
+                    ros_operator.puppet_arm_pose_publish(left_action, right_action)
+                    last_published_action = np.asarray(target_eef).copy()
+                    dagger_override_used = True
+                    dagger_log.append({
+                        "t": int(t),
+                        "frame": int(frame_counter),
+                        "policy_action": np.asarray(act, dtype=np.float64).tolist(),
+                        "policy_source": action_buffer_source,
+                        "executed_eef": target_eef.tolist(),
+                        "offset": dagger.offset.tolist(),
+                        "arm": dagger.arm,
+                    })
+                elif args.ctrl_type == "joint":
                     left_action, right_action = process_action(config["task"], act)
                     ros_operator.puppet_arm_publish(left_action, right_action)
+                    last_published_action = np.asarray(act).copy()
                 elif args.ctrl_type == "eef":
                     left_action, right_action = process_action(config["task"], act)
                     ros_operator.puppet_arm_pose_publish(left_action, right_action)
-                last_published_action = np.asarray(act).copy()
+                    last_published_action = np.asarray(act).copy()
 
                 t += 1
-                print(f"[Step {t:4d}] Published  (buf_idx={idx_in_chunk}/{chunk_size})")
+                if dagger_override_used:
+                    tag = "DAGGER"
+                elif in_s_hold:
+                    tag = "S_HOLD"
+                else:
+                    tag = action_buffer_source.upper()
+                print(f"[Step {t:4d}] Published [{tag}] (buf_idx={idx_in_chunk}/{chunk_size})")
                 rate.sleep()
+
+            # Drop any in-flight rescue without blocking — DAgger may have
+            # ended the episode while DreamDojo was still running.
+            if pending_rescue is not None:
+                pending_rescue["future"].cancel()
+                pending_rescue = None
+            rescue_executor.shutdown(wait=False, cancel_futures=True)
 
             suffix = "stopped" if user_stopped else "done"
             base_name = f"rollout_{task_segment}_ep{episode_idx}_{suffix}"
@@ -782,6 +1121,13 @@ def model_inference(args, config, ros_operator):
                 final_dir, task_description, suffix,
                 rescue_log, dual_head_log, value_selections,
             )
+
+            if args.dagger_mode and (dagger_log or sde_chunk_log):
+                _save_dagger_dataset(
+                    final_dir, task_description, suffix,
+                    dagger_log, sde_chunk_log,
+                    human_score=float(args.dagger_human_score),
+                )
 
             if collected_frames:
                 annotated = _annotate_rescue_frames(
@@ -902,6 +1248,121 @@ def _annotate_rescue_frames(frames: list, rescue_log: list, window: int) -> list
                             color, 1, cv2.LINE_AA)
         out.append(img)
     return out
+
+
+def _save_dagger_dataset(
+    rollout_dir: pathlib.Path,
+    task_description: str,
+    suffix: str,
+    dagger_log: list,
+    sde_chunk_log: list,
+    human_score: float = 0.0,
+):
+    """Persist DAgger pairs (policy vs human action) and SDE rescue chunks.
+
+    The two artifacts are written into ``rollout_dir/dagger/``:
+      * ``pairs.npz`` — per-step DAgger overrides. Arrays are aligned by index
+        and indicate (policy_action, executed_eef, offset, t, frame).
+      * ``sde_chunks.npz`` — every rescue-time SDE chunk that was injected
+        into the buffer. Useful for DreamDojo / value-expert finetuning.
+      * ``meta.json`` — a small JSON sidecar with the task language, episode
+        outcome, and per-event indices so loaders can match images with
+        actions.
+    """
+    out_dir = rollout_dir / "dagger"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if dagger_log:
+        n = len(dagger_log)
+        np.savez_compressed(
+            out_dir / "pairs.npz",
+            t=np.asarray([e["t"] for e in dagger_log], dtype=np.int64),
+            frame=np.asarray([e["frame"] for e in dagger_log], dtype=np.int64),
+            policy_action=np.asarray(
+                [e["policy_action"] for e in dagger_log], dtype=np.float32
+            ),
+            executed_eef=np.asarray(
+                [e["executed_eef"] for e in dagger_log], dtype=np.float32
+            ),
+            offset=np.asarray(
+                [e["offset"] for e in dagger_log], dtype=np.float32
+            ),
+            # Pseudo value-expert label for every human-teleop step. Lower is
+            # better in the existing expert's convention (value = 1 - progress);
+            # default 0.0 marks the human as "best".
+            human_score=np.full(n, float(human_score), dtype=np.float32),
+        )
+
+    if sde_chunk_log:
+        # For each rescue event we save every SDE candidate + its DreamDojo
+        # value-expert score, plus the chunk that was actually executed.
+        # Variable-length / per-event ragged data → object arrays.
+        chosen = np.empty(len(sde_chunk_log), dtype=object)
+        all_cands = np.empty(len(sde_chunk_log), dtype=object)
+        all_scores = np.empty(len(sde_chunk_log), dtype=object)
+        for i, e in enumerate(sde_chunk_log):
+            chosen[i] = np.asarray(e["actions"], dtype=np.float32)
+            cand_arr = np.asarray(e.get("all_candidates", []), dtype=np.float32)
+            all_cands[i] = cand_arr  # shape (num_samples, T, action_dim)
+            scores = e.get("all_candidate_scores", [])
+            all_scores[i] = np.asarray(
+                [np.nan if s is None else float(s) for s in scores],
+                dtype=np.float32,
+            )
+        best_scores = np.asarray(
+            [
+                np.nan if e.get("best_score") in (None, float("inf"))
+                else float(e["best_score"])
+                for e in sde_chunk_log
+            ],
+            dtype=np.float32,
+        )
+        np.savez_compressed(
+            out_dir / "sde_chunks.npz",
+            chosen_actions=chosen,
+            all_candidate_actions=all_cands,
+            all_candidate_scores=all_scores,
+            best_idx=np.asarray(
+                [e["best_idx"] for e in sde_chunk_log], dtype=np.int64,
+            ),
+            best_score=best_scores,
+            t_start=np.asarray([e["t_start"] for e in sde_chunk_log], dtype=np.int64),
+            frame_start=np.asarray(
+                [e["frame_start"] for e in sde_chunk_log], dtype=np.int64,
+            ),
+            progress=np.asarray(
+                [e.get("progress", np.nan) for e in sde_chunk_log], dtype=np.float32,
+            ),
+            success=np.asarray(
+                [e.get("success", np.nan) for e in sde_chunk_log], dtype=np.float32,
+            ),
+        )
+
+    meta = {
+        "task": task_description,
+        "outcome": suffix,
+        "num_dagger_steps": len(dagger_log),
+        "num_sde_chunks": len(sde_chunk_log),
+        "human_score": float(human_score),
+        "score_convention": "value = 1 - mean(progress); LOWER is better",
+        "dagger_arms": sorted({e["arm"] for e in dagger_log}) if dagger_log else [],
+        "policy_sources": sorted(
+            {e.get("policy_source", "?") for e in dagger_log}
+        ) if dagger_log else [],
+        "dagger_event_indices": [
+            {"t": e["t"], "frame": e["frame"]} for e in dagger_log
+        ],
+        "sde_event_indices": [
+            {"t_start": e["t_start"], "frame_start": e["frame_start"]}
+            for e in sde_chunk_log
+        ],
+    }
+    with open(out_dir / "meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+    logging.info(
+        f"[DAgger] Saved {len(dagger_log)} pairs and {len(sde_chunk_log)} "
+        f"SDE chunks to {out_dir}"
+    )
 
 
 def _write_results(
@@ -1037,14 +1498,37 @@ def get_arguments():
     parser.add_argument("--dd_host", type=str, default="127.0.0.1")
     parser.add_argument("--dd_base_port", type=int, default=8020)
     parser.add_argument("--num_sde_samples", type=int, default=4)
-    # ---- DINOv2 Value Expert ----
-    parser.add_argument("--value_expert_ckpt", type=str, default=None)
-    parser.add_argument("--num_clip_frames", type=int, default=4)
-    parser.add_argument("--dinov2_model", type=str, default="dinov2_vitb14",
-                        choices=["dinov2_vits14", "dinov2_vitb14", "dinov2_vitl14", "dinov2_vitg14"])
-    parser.add_argument("--attn_heads", type=int, default=8)
-    parser.add_argument("--attn_layers", type=int, default=2)
-    parser.add_argument("--value_hidden_dim", type=int, default=512)
+    # ---- DAgger keyboard teleop ----
+    parser.add_argument("--dagger_mode", action="store_true", default=False,
+                        help="Enable keyboard teleop overrides for the active "
+                             "arm. Letter keys (preferred — work on every "
+                             "terminal): i/k = x+/x-, j/l = y+/y-, u/d = z+/z-. "
+                             "Arrow keys (←→↑↓) are also accepted when the "
+                             "terminal sends standard ANSI sequences. Press "
+                             "'r' to release back to the policy. SDE chunks "
+                             "and per-step (policy_action, executed_eef) "
+                             "pairs are saved under <rollout>/dagger/ for "
+                             "later finetuning.")
+    parser.add_argument("--dagger_arm", type=str, choices=["left", "right"],
+                        default="right",
+                        help="Which arm the DAgger keys steer (default: right)")
+    parser.add_argument("--dagger_step_xyz", type=float, default=0.01,
+                        help="Per-keypress translation delta in metres "
+                             "applied to the active arm's x/y/z target.")
+    parser.add_argument("--dagger_human_score", type=float, default=0.0,
+                        help="Pseudo value-expert label assigned to every "
+                             "human-teleoperated step. The expert is trained "
+                             "with `value = 1 - mean(progress)`, so LOWER is "
+                             "better; 0.0 marks the human action as 'best' "
+                             "(default). Pass 1.0 if you want to flip the "
+                             "convention.")
+    parser.add_argument("--s_hold_seconds", type=float, default=3.0,
+                        help="When 's' is pressed, freeze the arm at the "
+                             "currently published action for this many "
+                             "seconds before any SDE chunk is allowed to "
+                             "inject. Gives the operator time to take over "
+                             "with DAgger keys. Auto rescues do not freeze. "
+                             "Set to 0 to disable.")
 
     return parser.parse_args()
 

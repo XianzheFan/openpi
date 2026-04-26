@@ -75,3 +75,17 @@ plug:
   right0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.028]
   action_postprocess:
     right_gripper: *default_right_gripper_postprocess
+
+spray_cap:
+  language_instruction: "Open the cap of the spray and place it on the table"
+  left0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  right0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  action_postprocess:
+    left_gripper:
+      - when: below
+        threshold: 0.01
+        set: 0.0
+    right_gripper:
+      - when: below
+        threshold: 0.01
+        set: 0.0

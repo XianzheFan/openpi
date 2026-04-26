@@ -57,7 +57,7 @@ class Args:
     # SDE sampling parameters. Higher noise_level → more diverse trajectories.
     noise_level: float = 0.3
     # Number of denoising steps.
-    num_steps: int = 3
+    num_steps: int = 5
 
 
 # Default checkpoints that should be used for each environment.

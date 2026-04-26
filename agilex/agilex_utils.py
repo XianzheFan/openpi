@@ -99,6 +99,43 @@ def check_keyboard_input():
     return None
 
 
+def read_keyboard_event(esc_timeout: float = 0.02):
+    """Non-blocking; return one event or None.
+
+    Returns the literal char for printable keys, or one of the symbolic names
+    'UP' / 'DOWN' / 'LEFT' / 'RIGHT' / 'ESC' for the corresponding ANSI escape
+    sequences. Recognises both the normal cursor mode (``ESC [ X``) and the
+    DECCKM "application cursor" mode (``ESC O X``) — many SSH/tmux terminals
+    default to the latter, and arrow keys are silently dropped if we only
+    accept ``[``. Requires stdin to be in cbreak/raw mode.
+    """
+    if not select.select([sys.stdin], [], [], 0)[0]:
+        return None
+    ch = sys.stdin.read(1)
+    if ch != "\x1b":
+        return ch
+    if not select.select([sys.stdin], [], [], esc_timeout)[0]:
+        return "ESC"
+    ch2 = sys.stdin.read(1)
+    if ch2 not in ("[", "O"):
+        return "ESC"
+    if not select.select([sys.stdin], [], [], esc_timeout)[0]:
+        return "ESC"
+    ch3 = sys.stdin.read(1)
+    return {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}.get(ch3, "ESC")
+
+
+def drain_keyboard_events(max_events: int = 32):
+    """Drain all pending keyboard events. Returns a list of event names."""
+    events = []
+    for _ in range(max_events):
+        ev = read_keyboard_event()
+        if ev is None:
+            break
+        events.append(ev)
+    return events
+
+
 def handle_interactive_mode(task_time):
     """
     Handle interactive mode when space is pressed.
@@ -125,7 +162,7 @@ def handle_interactive_mode(task_time):
             return "quit"
 
 
-def save_inference_data(args, timesteps, actions, dataset_path):
+def save_inference_data(args, timesteps, actions, dataset_path, success: bool = True):
     import h5py
 
     data_size = len(actions)
@@ -156,6 +193,7 @@ def save_inference_data(args, timesteps, actions, dataset_path):
     t0 = time.time()
     with h5py.File(dataset_path + ".hdf5", "w", rdcc_nbytes=1024**2 * 2) as root:
         root.attrs["rollout"] = True
+        root.attrs["success"] = bool(success)
 
         obs = root.create_group("observations")
         image = obs.create_group("images")
@@ -173,7 +211,8 @@ def save_inference_data(args, timesteps, actions, dataset_path):
 
         for name, array in data_dict.items():
             root[name][...] = array
-    print(f"\033[32m\nSaving: {time.time() - t0:.1f} secs. %s \033[0m\n" % dataset_path)
+    tag = "SUCCESS" if success else "FAIL"
+    print(f"\033[32m\nSaving[{tag}]: {time.time() - t0:.1f} secs. %s \033[0m\n" % dataset_path)
 
 
 class InferenceDataRecorder:
@@ -218,13 +257,13 @@ class InferenceDataRecorder:
 
     def wait_save_choice(self):
         print(
-            "\n\033[33m\nRollout paused. Press 's' to SAVE or 'q' to DISCARD: \033[0m",
+            "\n\033[33m\nRollout paused. Press 'y' = SUCCESS, 'n' = FAIL, 'q' = DISCARD: \033[0m",
             end="",
             flush=True,
         )
         while not self.should_stop_waiting():
             key = sys.stdin.read(1).lower()
-            if key in {"s", "q"}:
+            if key in {"y", "n", "q"}:
                 print(key)
                 return key
         return "q"
@@ -239,14 +278,20 @@ class InferenceDataRecorder:
 
         print("len(timesteps): ", len(self.timesteps))
         print("len(actions)  : ", len(self.actions))
-        if self.wait_save_choice() != "s":
+        choice = self.wait_save_choice()
+        if choice == "q":
             print(f"\033[31m\nEpisode discarded. {len(self.actions)} frames thrown away.\033[0m")
             self.reset()
             return
 
+        success = (choice == "y")
         dataset_path = os.path.join(self.save_dir, f"episode_{self.episode_idx}")
-        save_inference_data(self.save_args, self.timesteps.copy(), self.actions.copy(), dataset_path)
-        print(f"\033[32mEpisode {self.episode_idx} saved successfully!\033[0m")
+        save_inference_data(
+            self.save_args, self.timesteps.copy(), self.actions.copy(), dataset_path,
+            success=success,
+        )
+        tag = "SUCCESS" if success else "FAIL"
+        print(f"\033[32mEpisode {self.episode_idx} saved as {tag}!\033[0m")
         self.episode_idx += 1
         self.reset()
 
