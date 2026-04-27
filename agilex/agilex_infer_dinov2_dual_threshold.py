@@ -404,6 +404,8 @@ def _select_best_action_with_prefix(
     num_samples: int,
     prefix_action: "np.ndarray | None",
     skip_steps: int,
+    dd_action_stride: int = 4,
+    dd_action_chunk_in: int = 13,
 ) -> tuple[np.ndarray, dict]:
     """Sends action candidates to DreamDojo server, which generates the video 
     AND scores it in-memory, returning the score over the network.
@@ -422,19 +424,30 @@ def _select_best_action_with_prefix(
 
     frame_img = obs_snapshot["top"]
     save_prefix = str(step_save_dir.absolute())
+    # Subsample 30Hz pi05 chunks down to DreamDojo training rate
+    # (new_agilex_3view: timestep_interval=4 over 30fps native = 7.5fps).
+    # Send `dd_action_chunk_in` (default 13 = model_action_chunk+1) entries
+    # spaced by `dd_action_stride` so DreamDojo's grouped-delta computation
+    # sees in-distribution motion magnitudes.
+    s = max(1, int(dd_action_stride))
+    n_in = max(1, int(dd_action_chunk_in))
     tasks = [
         {
             "host": dd_host,
             "port": dd_base_port + i,
-            "actions": np.asarray(action_chunks[i][:exec_horizon], dtype=np.float32),
+            "actions": np.asarray(
+                action_chunks[i][:exec_horizon][::s][:n_in], dtype=np.float32
+            ),
             "save_name": f"{save_prefix}/chunk_{i}",
-        } # 强制使用绝对路径，确保服务端能存到你这里
+        }
         for i in range(num_samples)
     ]
 
     logging.info(
         f"[Dual] Launching {num_samples} DreamDojo gens+scores "
-        f"(prefix_skip={skip}, horizon={exec_horizon})..."
+        f"(prefix_skip={skip}, horizon={exec_horizon}, "
+        f"dd_stride={s}, dd_n_in={n_in}, "
+        f"sent_actions={tasks[0]['actions'].shape[0] if tasks else 0})..."
     )
 
     def _submit(task):
@@ -830,6 +843,8 @@ def model_inference(args, config, ros_operator):
                                 num_samples=args.num_sde_samples,
                                 prefix_action=last_published_action,
                                 skip_steps=args.rescue_skip_sde_steps,
+                                dd_action_stride=args.dd_action_stride,
+                                dd_action_chunk_in=args.dd_action_chunk_in,
                             )
                         else:
                             print(f"\033[93m>>> [System] DreamDojo running SYNC ({args.num_sde_samples} candidates). Arm pausing until candidates scored...\033[0m\n", flush=True)
@@ -846,6 +861,8 @@ def model_inference(args, config, ros_operator):
                                     num_samples=args.num_sde_samples,
                                     prefix_action=last_published_action,
                                     skip_steps=args.rescue_skip_sde_steps,
+                                    dd_action_stride=args.dd_action_stride,
+                                    dd_action_chunk_in=args.dd_action_chunk_in,
                                 )
                                 future.set_result(_sync_result)
                             except Exception as _sync_err:
@@ -1474,6 +1491,16 @@ def get_arguments():
                              "DreamDojo scoring and for execution) to suppress "
                              "the 'rescue swings home first' artifact. 0 keeps "
                              "the raw SDE chunk head.")
+    parser.add_argument("--dd_action_stride", type=int, default=4,
+                        help="Stride applied to the pi05 action chunk before "
+                             "sending to DreamDojo. Default 4 matches the "
+                             "new_agilex_3view training (timestep_interval=4 "
+                             "over 30fps native = 7.5fps). Set to 1 to send "
+                             "raw pi05 actions (training-distribution mismatch).")
+    parser.add_argument("--dd_action_chunk_in", type=int, default=13,
+                        help="Number of strided actions to send to DreamDojo "
+                             "per candidate. Default 13 = num_action_per_chunk "
+                             "+ 1 expected by the model's grouped-delta loop.")
     parser.add_argument("--show_live_window", action="store_true", default=False,
                         help="Open a cv2 window that shows the rollout frame "
                              "with the latest dual-head p/s scores overlaid "

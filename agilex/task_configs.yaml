@@ -89,3 +89,17 @@ spray_cap:
       - when: below
         threshold: 0.01
         set: 0.0
+
+screw:
+  language_instruction: "Insert the screw into the hole in the box."
+  left0: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  right0: [0.509574128, 2.21687074, -1.4768962600000002, -0.21211904, -0.47826214800000005, -0.24953642, 0.0072]
+  action_postprocess:
+    left_gripper:
+      - when: below
+        threshold: 0.01
+        set: 0.0
+    right_gripper:
+      - when: below
+        threshold: 0.01
+        set: 0.0

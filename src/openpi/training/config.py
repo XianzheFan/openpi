@@ -1110,6 +1110,45 @@ _CONFIGS = [
         batch_size=64,
         num_workers=8,
     ),
+    #
+    # Fine-tuning pi05 on screw_0426 (local LeRobot dataset).
+    #
+    TrainConfig(
+        name="pi05_screw",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="screw",
+            base_config=DataConfig(
+                local_dirs=[
+                    "data/screw_0426",
+                ],
+            ),
+            assets=AssetsConfig(
+                assets_dir="gs://openpi-assets/checkpoints/pi05_base/assets",
+                asset_id="trossen",
+            ),
+            default_prompt="Insert the screw into the hole in the box.",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=50_000,
+        batch_size=64,
+        num_workers=8,
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
