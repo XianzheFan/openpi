@@ -450,6 +450,30 @@ def _select_best_action_with_prefix(
         f"sent_actions={tasks[0]['actions'].shape[0] if tasks else 0})..."
     )
 
+    for i, ch in enumerate(action_chunks):
+        raw = np.asarray(ch[:exec_horizon], dtype=np.float32)
+        sub = np.asarray(tasks[i]["actions"], dtype=np.float32)
+        if raw.shape[0] >= 2:
+            raw_d = np.linalg.norm(np.diff(raw, axis=0), axis=1)
+            raw_stats = (
+                f"mean={raw_d.mean():.4f} max={raw_d.max():.4f} "
+                f"min={raw_d.min():.4f} sum={raw_d.sum():.4f}"
+            )
+        else:
+            raw_stats = "n<2"
+        if sub.shape[0] >= 2:
+            sub_d = np.linalg.norm(np.diff(sub, axis=0), axis=1)
+            sub_stats = (
+                f"mean={sub_d.mean():.4f} max={sub_d.max():.4f} "
+                f"min={sub_d.min():.4f} sum={sub_d.sum():.4f}"
+            )
+        else:
+            sub_stats = "n<2"
+        logging.info(
+            f"[Dual][cand={i}] raw_chunk(N={raw.shape[0]}) Δ-norm: {raw_stats} | "
+            f"sent_to_dd(N={sub.shape[0]}, stride={s}) Δ-norm: {sub_stats}"
+        )
+
     def _submit(task):
         return _dreamdojo_generate(
             task["host"], task["port"], frame_img,
