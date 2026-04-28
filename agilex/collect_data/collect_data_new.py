@@ -223,7 +223,7 @@ def get_arguments():
         action="store",
         type=str,
         help="leader_arm_left_topic",
-        default="/master/joint_left",
+        default="/leader/joint_left",
         required=False,
     )
     parser.add_argument(
@@ -231,7 +231,7 @@ def get_arguments():
         action="store",
         type=str,
         help="leader_arm_right_topic",
-        default="/master/joint_right",
+        default="/leader/joint_right",
         required=False,
     )
     parser.add_argument(
@@ -239,7 +239,7 @@ def get_arguments():
         action="store",
         type=str,
         help="follower_arm_left_topic",
-        default="/puppet/joint_left",
+        default="/follower/joint_left",
         required=False,
     )
     parser.add_argument(
@@ -247,7 +247,7 @@ def get_arguments():
         action="store",
         type=str,
         help="follower_arm_right_topic",
-        default="/puppet/joint_right",
+        default="/follower/joint_right",
         required=False,
     )
     parser.add_argument(
@@ -255,7 +255,7 @@ def get_arguments():
         action="store",
         type=str,
         help="follower_arm_left_pose_topic",
-        default="/puppet/end_pose_euler_left",
+        default="/follower/end_pose_euler_left",
         required=False,
     )
     parser.add_argument(
@@ -263,7 +263,7 @@ def get_arguments():
         action="store",
         type=str,
         help="follower_arm_right_pose_topic",
-        default="/puppet/end_pose_euler_right",
+        default="/follower/end_pose_euler_right",
         required=False,
     )
 

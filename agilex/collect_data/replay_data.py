@@ -161,7 +161,7 @@ if __name__ == "__main__":
         action="store",
         type=str,
         help="control_arm_left_topic",
-        default="/master/joint_left",
+        default="/leader/joint_left",
         required=False,
     )
     parser.add_argument(
@@ -169,7 +169,7 @@ if __name__ == "__main__":
         action="store",
         type=str,
         help="control_arm_right_topic",
-        default="/master/joint_right",
+        default="/leader/joint_right",
         required=False,
     )
     parser.add_argument(
@@ -177,7 +177,7 @@ if __name__ == "__main__":
         action="store",
         type=str,
         help="control_arm_left_pose_topic",
-        default="/puppet/pos_cmd_left",
+        default="/follower/pos_cmd_left",
         required=False,
     )
     parser.add_argument(
@@ -185,7 +185,7 @@ if __name__ == "__main__":
         action="store",
         type=str,
         help="control_arm_right_pose_topic",
-        default="/puppet/pos_cmd_right",
+        default="/follower/pos_cmd_right",
         required=False,
     )
     parser.add_argument(
