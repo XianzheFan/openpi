@@ -202,7 +202,15 @@ class ValueExpertScorer:
 
 
 def _dreamdojo_generate(host: str, port: int, frame_np: np.ndarray, actions: np.ndarray,
-                        save_name: str, task_description: str = "") -> str | None:
+                        save_name: str, task_description: str = "",
+                        frame_left_np: np.ndarray | None = None,
+                        frame_right_np: np.ndarray | None = None) -> str | None:
+    """Send a generation request to the DreamDojo server.
+
+    For agilex_3view / new_agilex_3view experiments, pass `frame_left_np` and
+    `frame_right_np` as well so the server can tile (top, left, right) into the
+    480x640 2x2 layout that matches training.
+    """
     url = f"http://{host}:{port}/generate"
 
     h, w = frame_np.shape[:2]
@@ -216,6 +224,17 @@ def _dreamdojo_generate(host: str, port: int, frame_np: np.ndarray, actions: np.
         "save_name": save_name,
         "prompt": task_description,
     }
+    if frame_left_np is not None and frame_right_np is not None:
+        # Server expects identical (h, w) for all three views; resize on the
+        # client side if the shapes don't already match the cam_high image.
+        if frame_left_np.shape[:2] != (h, w) or frame_right_np.shape[:2] != (h, w):
+            import cv2
+            if frame_left_np.shape[:2] != (h, w):
+                frame_left_np = cv2.resize(frame_left_np, (w, h))
+            if frame_right_np.shape[:2] != (h, w):
+                frame_right_np = cv2.resize(frame_right_np, (w, h))
+        payload["frame_left"]  = base64.b64encode(np.ascontiguousarray(frame_left_np).tobytes()).decode()
+        payload["frame_right"] = base64.b64encode(np.ascontiguousarray(frame_right_np).tobytes()).decode()
     try:
         resp = requests.post(url, json=payload, timeout=600)
         resp.raise_for_status()

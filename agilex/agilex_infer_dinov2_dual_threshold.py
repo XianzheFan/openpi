@@ -422,8 +422,14 @@ def _select_best_action_with_prefix(
             ch[:k] = np.asarray(prefix_action, dtype=ch.dtype)
         action_chunks.append(ch)
 
-    frame_img = obs_snapshot["top"]
-    save_prefix = str(step_save_dir.absolute())
+    frame_img       = obs_snapshot["top"]
+    frame_left_img  = obs_snapshot.get("left")
+    frame_right_img = obs_snapshot.get("right")
+    # Server-side save path is rooted at its own --save-dir; pass only the
+    # leaf directory name so the saved video lands under
+    # "<server save_dir>/<step_dir.name>/chunk_<i>_s<server_id>_epN.mp4"
+    # rather than mirroring the absolute client path.
+    save_prefix = step_save_dir.name
     # Subsample 30Hz pi05 chunks down to DreamDojo training rate
     # (new_agilex_3view: timestep_interval=4 over 30fps native = 7.5fps).
     # Send `dd_action_chunk_in` (default 13 = model_action_chunk+1) entries
@@ -478,6 +484,8 @@ def _select_best_action_with_prefix(
         return _dreamdojo_generate(
             task["host"], task["port"], frame_img,
             task["actions"], task["save_name"], task_description,
+            frame_left_np=frame_left_img,
+            frame_right_np=frame_right_img,
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, num_samples)) as ex:
