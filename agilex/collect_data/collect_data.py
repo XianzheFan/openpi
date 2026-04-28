@@ -48,43 +48,34 @@ class KeyboardHandler:
                     return key
 
 
-# 保存数据函数
 def save_data(args, timesteps, actions, dataset_path):
-    # 数据字典
     data_size = len(actions)
     data_dict = {
-        # 一个是奖励里面的qpos，qvel， effort ,一个是实际发的acition
         "/observations/qpos": [],
         "/observations/qvel": [],
         "/observations/effort": [],
         "/observations/eef_pose": [],
         "/action": [],
+        "/collect": [],
     }
 
-    # 相机字典  观察的图像
     for cam_name in args.camera_names:
         data_dict[f"/observations/images/{cam_name}"] = []
         if args.use_depth_image:
             data_dict[f"/observations/images_depth/{cam_name}"] = []
 
-    # len(action): max_timesteps, len(time_steps): max_timesteps + 1
-    # 动作长度 遍历动作
     while actions:
-        # 循环弹出一个队列
-        action = actions.pop(0)  # 动作  当前动作
-        ts = timesteps.pop(0)  # 奖励  前一帧
+        action = actions.pop(0)
+        ts = timesteps.pop(0)
 
-        # 往字典里面添值
-        # Timestep返回的qpos，qvel,effort
         data_dict["/observations/qpos"].append(ts.observation["qpos"])
         data_dict["/observations/qvel"].append(ts.observation["qvel"])
         data_dict["/observations/effort"].append(ts.observation["effort"])
         data_dict["/observations/eef_pose"].append(ts.observation["eef_pose"])
 
-        # 实际发的action
         data_dict["/action"].append(action)
+        data_dict["/collect"].append("teleop")
 
-        # 相机数据
         for cam_name in args.camera_names:
             data_dict[f"/observations/images/{cam_name}"].append(ts.observation["images"][cam_name])
             if args.use_depth_image:
@@ -92,15 +83,6 @@ def save_data(args, timesteps, actions, dataset_path):
 
     t0 = time.time()
     with h5py.File(dataset_path + ".hdf5", "w", rdcc_nbytes=1024**2 * 2) as root:
-        # 文本的属性：
-        # 1 是否仿真
-        # 2 图像是否压缩
-        #
-        root.attrs["sim"] = False
-        root.attrs["compress"] = False
-
-        # 创建一个新的组observations，观测状态组
-        # 图像组
         obs = root.create_group("observations")
         image = obs.create_group("images")
         for cam_name in args.camera_names:
@@ -125,6 +107,7 @@ def save_data(args, timesteps, actions, dataset_path):
         _ = obs.create_dataset("effort", (data_size, 14))
         _ = obs.create_dataset("eef_pose", (data_size, 14))
         _ = root.create_dataset("action", (data_size, 14))
+        _ = root.create_dataset("collect", (data_size,), dtype=h5py.string_dtype(encoding="utf-8"))
 
         # data_dict write into h5py.File
         for name, array in data_dict.items():
@@ -139,7 +122,7 @@ def get_arguments():
         action="store",
         type=str,
         help="Dataset_dir.",
-        default="/home/sail/data",
+        default="",
         required=False,
     )
     parser.add_argument(
@@ -147,7 +130,7 @@ def get_arguments():
         action="store",
         type=str,
         help="Task name.",
-        default="aloha_mobile_dummy",
+        default="test",
         required=True,
     )
     parser.add_argument(

@@ -271,7 +271,7 @@ class InferenceDataRecorder:
         self.save_dir = os.path.expanduser(args.save_dir)
         self.episode_idx = 0
         if self.enabled:
-            from collect_data.collect_data_new import get_next_episode_idx
+            from collect_data.collect_data import get_next_episode_idx
 
             os.makedirs(self.save_dir, exist_ok=True)
             self.episode_idx = get_next_episode_idx(self.save_dir)
