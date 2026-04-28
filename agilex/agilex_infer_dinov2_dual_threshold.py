@@ -425,11 +425,16 @@ def _select_best_action_with_prefix(
     frame_img       = obs_snapshot["top"]
     frame_left_img  = obs_snapshot.get("left")
     frame_right_img = obs_snapshot.get("right")
-    # Server-side save path is rooted at its own --save-dir; pass only the
-    # leaf directory name so the saved video lands under
-    # "<server save_dir>/<step_dir.name>/chunk_<i>_s<server_id>_epN.mp4"
-    # rather than mirroring the absolute client path.
-    save_prefix = step_save_dir.name
+    # Server-side save path is rooted at its own --save-dir; pass a short
+    # relative prefix so the saved video lands under
+    # "<server save_dir>/rollout_<task>_ep<N>_running/rescue_steps/t<t>_f<frame>/
+    #  chunk_<i>_s<server_id>_epN.mp4"
+    # That keeps the rollout / episode / step info but avoids mirroring the
+    # absolute client-side path. step_save_dir is built as
+    # "<output_dir>/rollout_..._ep<N>_running/rescue_steps/t<t>_f<frame>"
+    # so the trailing 3 path parts encode everything we want to keep.
+    tail_parts = step_save_dir.parts[-3:]
+    save_prefix = "/".join(tail_parts) if tail_parts else step_save_dir.name
     # Subsample 30Hz pi05 chunks down to DreamDojo training rate
     # (new_agilex_3view: timestep_interval=4 over 30fps native = 7.5fps).
     # Send `dd_action_chunk_in` (default 13 = model_action_chunk+1) entries
