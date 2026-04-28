@@ -701,6 +701,12 @@ def model_inference(args, config, ros_operator):
             s_hold_until_t = -1
             s_hold_action: np.ndarray | None = None
             s_hold_steps = max(0, int(round(args.s_hold_seconds * args.publish_rate)))
+            # Extra publish-step gap inserted between chained manual rescues
+            # so the arm has time to settle and the camera sees the result of
+            # the previous chunk before the next one is computed.
+            manual_chain_gap_steps = max(
+                0, int(round(args.manual_rescue_chain_pause_sec * args.publish_rate))
+            )
 
             while t < max_publish_step and not rospy.is_shutdown() and not shutdown_event.is_set():
                 manual_rescue_pressed = False
@@ -737,14 +743,15 @@ def model_inference(args, config, ros_operator):
                     break
 
                 # Auto-chain follow-up manual rescues: fire only once the
-                # previous rescue chunk has fully played out and there is no
-                # in-flight DreamDojo job. Each follow-up uses a fresh
-                # obs_snapshot captured later in this same loop iteration.
+                # previous rescue chunk has fully played out (plus optional
+                # observation-settle gap) and there is no in-flight DreamDojo
+                # job. Each follow-up uses a fresh obs_snapshot captured
+                # later in this same loop iteration.
                 if (
                     not manual_rescue_pressed
                     and manual_rescue_remaining > 0
                     and pending_rescue is None
-                    and frame_counter > rescue_active_until_frame
+                    and frame_counter > rescue_active_until_frame + manual_chain_gap_steps
                 ):
                     manual_rescue_pressed = True
                     manual_rescue_remaining -= 1
@@ -1633,6 +1640,13 @@ def get_arguments():
                              "rescue is queued automatically right after the "
                              "previous chunk finishes playing, using a fresh "
                              "observation snapshot. 1 = legacy single-shot.")
+    parser.add_argument("--manual_rescue_chain_pause_sec", type=float, default=0.0,
+                        help="Wait this many seconds AFTER the previous "
+                             "rescue chunk finishes publishing before "
+                             "launching the next chained manual rescue. "
+                             "Useful when the arm needs a beat to settle so "
+                             "the next obs_snapshot reflects steady state. "
+                             "0 = chain immediately (legacy).")
 
     return parser.parse_args()
 
