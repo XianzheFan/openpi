@@ -119,23 +119,23 @@ def update_observation_window(args, config, ros_operator):
                 }
             )
 
-    img_front, img_left, img_right, puppet_arm_left, puppet_arm_right, endpose_left, endpose_right = (
+    img_front, img_left, img_right, follower_arm_left, follower_arm_right, endpose_left, endpose_right = (
         get_ros_observation(args, ros_operator)
     )
 
     qpos = np.concatenate(
-        (np.array(puppet_arm_left.position), np.array(puppet_arm_right.position)),
+        (np.array(follower_arm_left.position), np.array(follower_arm_right.position)),
         axis=0,
     )
 
     left_pos = endpose_left.pose.position
     left_rpy = quat_2_euler(endpose_left.pose.orientation)
-    left_gripper = puppet_arm_left.position[-1]
+    left_gripper = follower_arm_left.position[-1]
     endpose_left_arr = np.array([left_pos.x, left_pos.y, left_pos.z, left_rpy[0], left_rpy[1], left_rpy[2], left_gripper])
 
     right_pos = endpose_right.pose.position
     right_rpy = quat_2_euler(endpose_right.pose.orientation)
-    right_gripper = puppet_arm_right.position[-1]
+    right_gripper = follower_arm_right.position[-1]
     endpose_right_arr = np.array(
         [right_pos.x, right_pos.y, right_pos.z, right_rpy[0], right_rpy[1], right_rpy[2], right_gripper]
     )
@@ -754,7 +754,7 @@ def model_inference(args, config, ros_operator):
     task_description = config["language_instruction"]
     print(config)
 
-    ros_operator.puppet_arm_publish_continuous(left0, right0)
+    ros_operator.follower_arm_publish_continuous(left0, right0)
     print("Warmup the server...")
     policy.warmup(rtc=(args.mode == "rtc"), streaming=args.streaming)
     print("Server warmed up")
@@ -782,7 +782,7 @@ def model_inference(args, config, ros_operator):
 
             input("Press enter to start episode")
             task_time = time.time()
-            ros_operator.puppet_arm_publish_continuous(left0, right0)
+            ros_operator.follower_arm_publish_continuous(left0, right0)
 
             # Gemini value tracking
             score_history: list = []
@@ -820,7 +820,7 @@ def model_inference(args, config, ros_operator):
                     inference_paused.clear()
                     result = handle_interactive_mode(task_time)
                     if result == "reset":
-                        ros_operator.puppet_arm_publish_continuous(left0, right0)
+                        ros_operator.follower_arm_publish_continuous(left0, right0)
                         user_stopped = True
                         break
                     elif result == "quit":
@@ -918,7 +918,7 @@ def model_inference(args, config, ros_operator):
 
                 if args.ctrl_type == "joint":
                     left_action, right_action = process_action(config["task"], act)
-                    ros_operator.puppet_arm_publish(left_action, right_action)
+                    ros_operator.follower_arm_publish(left_action, right_action)
                 elif args.ctrl_type == "ee6d":
                     act = abs_6d_2_abs_euler(act)
                     left_action, right_action = process_action(config["task"], act)
@@ -966,10 +966,10 @@ def model_inference(args, config, ros_operator):
             episode_idx += 1
 
             # Reset to starting position
-            ros_operator.puppet_arm_publish_continuous(left0, right0)
+            ros_operator.follower_arm_publish_continuous(left0, right0)
 
     finally:
-        ros_operator.puppet_arm_publish_continuous(left0, right0)
+        ros_operator.follower_arm_publish_continuous(left0, right0)
 
 
 def get_arguments():
@@ -983,10 +983,10 @@ def get_arguments():
     parser.add_argument("--img_front_depth_topic", type=str, default="/camera_f/depth/image_raw")
     parser.add_argument("--img_left_depth_topic", type=str, default="/camera_l/depth/image_raw")
     parser.add_argument("--img_right_depth_topic", type=str, default="/camera_r/depth/image_raw")
-    parser.add_argument("--puppet_arm_left_cmd_topic", type=str, default="/master/joint_left")
-    parser.add_argument("--puppet_arm_right_cmd_topic", type=str, default="/master/joint_right")
-    parser.add_argument("--puppet_arm_left_topic", type=str, default="/puppet/joint_left")
-    parser.add_argument("--puppet_arm_right_topic", type=str, default="/puppet/joint_right")
+    parser.add_argument("--follower_arm_left_cmd_topic", type=str, default="/master/joint_left")
+    parser.add_argument("--follower_arm_right_cmd_topic", type=str, default="/master/joint_right")
+    parser.add_argument("--follower_arm_left_topic", type=str, default="/puppet/joint_left")
+    parser.add_argument("--follower_arm_right_topic", type=str, default="/puppet/joint_right")
     parser.add_argument("--endpose_left_cmd_topic", type=str, default="/puppet/pos_cmd_left")
     parser.add_argument("--endpose_right_cmd_topic", type=str, default="/puppet/pos_cmd_right")
     parser.add_argument("--endpose_left_topic", type=str, default="/puppet/end_pose_left")

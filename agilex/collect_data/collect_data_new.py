@@ -219,50 +219,50 @@ def get_arguments():
 
     # topic name of arm
     parser.add_argument(
-        "--master_arm_left_topic",
+        "--leader_arm_left_topic",
         action="store",
         type=str,
-        help="master_arm_left_topic",
+        help="leader_arm_left_topic",
         default="/master/joint_left",
         required=False,
     )
     parser.add_argument(
-        "--master_arm_right_topic",
+        "--leader_arm_right_topic",
         action="store",
         type=str,
-        help="master_arm_right_topic",
+        help="leader_arm_right_topic",
         default="/master/joint_right",
         required=False,
     )
     parser.add_argument(
-        "--puppet_arm_left_topic",
+        "--follower_arm_left_topic",
         action="store",
         type=str,
-        help="puppet_arm_left_topic",
+        help="follower_arm_left_topic",
         default="/puppet/joint_left",
         required=False,
     )
     parser.add_argument(
-        "--puppet_arm_right_topic",
+        "--follower_arm_right_topic",
         action="store",
         type=str,
-        help="puppet_arm_right_topic",
+        help="follower_arm_right_topic",
         default="/puppet/joint_right",
         required=False,
     )
     parser.add_argument(
-        "--puppet_arm_left_pose_topic",
+        "--follower_arm_left_pose_topic",
         action="store",
         type=str,
-        help="puppet_arm_left_pose_topic",
+        help="follower_arm_left_pose_topic",
         default="/puppet/end_pose_euler_left",
         required=False,
     )
     parser.add_argument(
-        "--puppet_arm_right_pose_topic",
+        "--follower_arm_right_pose_topic",
         action="store",
         type=str,
-        help="puppet_arm_right_pose_topic",
+        help="follower_arm_right_pose_topic",
         default="/puppet/end_pose_euler_right",
         required=False,
     )

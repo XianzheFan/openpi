@@ -34,8 +34,11 @@ import zmq
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from agilex_utils import (
     InferenceDataRecorder,
+    build_observation,
     check_keyboard_input,
     get_config,
+    get_inference_observation,
+    get_rollout_observation,
     handle_interactive_mode,
     process_action,
 )
@@ -44,7 +47,7 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
-from ros_operator import RosOperator, get_latest_ros_observation, get_ros_observation
+from ros_operator import RosOperator
 
 observation_window = None
 observation_window_lock = threading.Lock()
@@ -212,50 +215,6 @@ def reset_observation_window():
         observation_window = None
 
 
-def build_observation(observation, config, ros_operator):
-    if observation is None:
-        return None
-
-    (
-        img_front,
-        img_left,
-        img_right,
-        puppet_arm_left,
-        puppet_arm_right,
-        puppet_arm_left_pose,
-        puppet_arm_right_pose,
-    ) = observation
-
-    qpos = np.concatenate(
-        (np.array(puppet_arm_left.position), np.array(puppet_arm_right.position)),
-        axis=0,
-    )
-    eef_pose = ros_operator.build_puppet_arm_pose(
-        puppet_arm_left_pose,
-        puppet_arm_right_pose,
-        puppet_arm_left,
-        puppet_arm_right,
-    )
-
-    return {
-        "qpos": qpos,
-        "eef_pose": eef_pose,
-        "images": {
-            config["camera_names"][0]: img_front,
-            config["camera_names"][1]: img_left,
-            config["camera_names"][2]: img_right,
-        },
-    }
-
-
-def get_inference_observation(args, config, ros_operator):
-    return build_observation(get_ros_observation(args, ros_operator), config, ros_operator)
-
-
-def get_rollout_observation(args, config, ros_operator):
-    return build_observation(get_latest_ros_observation(args, ros_operator), config, ros_operator)
-
-
 def update_observation_window(args, config, ros_operator):
     global observation_window
     with observation_window_lock:
@@ -324,7 +283,7 @@ def model_inference(args, config, ros_operator):
     left0 = config["left0"]
     right0 = config["right0"]
 
-    ros_operator.puppet_arm_publish_continuous(left0, right0)
+    ros_operator.follower_arm_publish_continuous(left0, right0)
 
     print("Warmup the GR00T server...")
     policy.warmup()
@@ -332,7 +291,7 @@ def model_inference(args, config, ros_operator):
 
     input("Press enter to continue")
     task_time = time.time()
-    ros_operator.puppet_arm_publish_continuous(left0, right0)
+    ros_operator.follower_arm_publish_continuous(left0, right0)
     recorder = InferenceDataRecorder(args, config, shutdown_event=shutdown_event)
 
     try:
@@ -356,7 +315,7 @@ def model_inference(args, config, ros_operator):
                     if result == "reset":
                         recorder.save_episode()
                         episode_closed = True
-                        ros_operator.puppet_arm_publish_continuous(left0, right0)
+                        ros_operator.follower_arm_publish_continuous(left0, right0)
                         input("Press enter to continue")
                         task_time = time.time()
                         break
@@ -383,11 +342,11 @@ def model_inference(args, config, ros_operator):
                 if args.ctrl_type == "joint":
                     left_action, right_action = process_action(config["task"], act)
                     action_to_save = np.concatenate((left_action, right_action), axis=0)
-                    ros_operator.puppet_arm_publish(left_action, right_action)
+                    ros_operator.follower_arm_publish(left_action, right_action)
                 elif args.ctrl_type == "eef":
                     left_action, right_action = process_action(config["task"], act)
                     action_to_save = np.concatenate((left_action, right_action), axis=0)
-                    ros_operator.puppet_arm_pose_publish(left_action, right_action)
+                    ros_operator.follower_arm_pose_publish(left_action, right_action)
 
                 recorder.add_step(observation_to_save, action_to_save)
                 t += 1
@@ -399,7 +358,7 @@ def model_inference(args, config, ros_operator):
             if shutdown_event.is_set():
                 return
     finally:
-        ros_operator.puppet_arm_publish_continuous(left0, right0)
+        ros_operator.follower_arm_publish_continuous(left0, right0)
 
 
 def get_arguments():
@@ -411,14 +370,14 @@ def get_arguments():
     parser.add_argument("--img_front_depth_topic", type=str, default="/camera_f/depth/image_raw")
     parser.add_argument("--img_left_depth_topic", type=str, default="/camera_l/depth/image_raw")
     parser.add_argument("--img_right_depth_topic", type=str, default="/camera_r/depth/image_raw")
-    parser.add_argument("--master_arm_left_topic", type=str, default="/master/joint_left")
-    parser.add_argument("--master_arm_right_topic", type=str, default="/master/joint_right")
-    parser.add_argument("--puppet_arm_left_topic", type=str, default="/puppet/joint_left")
-    parser.add_argument("--puppet_arm_right_topic", type=str, default="/puppet/joint_right")
+    parser.add_argument("--leader_arm_left_topic", type=str, default="/master/joint_left")
+    parser.add_argument("--leader_arm_right_topic", type=str, default="/master/joint_right")
+    parser.add_argument("--follower_arm_left_topic", type=str, default="/puppet/joint_left")
+    parser.add_argument("--follower_arm_right_topic", type=str, default="/puppet/joint_right")
     parser.add_argument("--pos_cmd_left_topic", type=str, default="/puppet/pos_cmd_left")
     parser.add_argument("--pos_cmd_right_topic", type=str, default="/puppet/pos_cmd_right")
-    parser.add_argument("--puppet_arm_left_pose_topic", type=str, default="/puppet/end_pose_euler_left")
-    parser.add_argument("--puppet_arm_right_pose_topic", type=str, default="/puppet/end_pose_euler_right")
+    parser.add_argument("--follower_arm_left_pose_topic", type=str, default="/puppet/end_pose_euler_left")
+    parser.add_argument("--follower_arm_right_pose_topic", type=str, default="/puppet/end_pose_euler_right")
     parser.add_argument("--publish_rate", type=int, default=30)
     # GR00T agilex action horizon is 16 (action delta_indices = range(16)).
     parser.add_argument("--chunk_size", type=int, default=16)

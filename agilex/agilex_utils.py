@@ -71,7 +71,7 @@ def _apply_gripper_rules(gripper_value, rules):
             gripper_value = rule["set"]
         if "add" in rule:
             gripper_value += rule["add"]
-    return gripper_value
+    return max(0, gripper_value)
 
 
 def process_action(task, action):
@@ -160,6 +160,54 @@ def handle_interactive_mode(task_time):
         elif key == "q":
             print("Stopping...")
             return "quit"
+
+
+def build_observation(observation, config, ros_operator):
+    if observation is None:
+        return None
+
+    (
+        img_front,
+        img_left,
+        img_right,
+        follower_arm_left,
+        follower_arm_right,
+        follower_arm_left_pose,
+        follower_arm_right_pose,
+    ) = observation
+
+    qpos = np.concatenate(
+        (np.array(follower_arm_left.position), np.array(follower_arm_right.position)),
+        axis=0,
+    )
+    eef_pose = ros_operator.build_follower_arm_pose(
+        follower_arm_left_pose,
+        follower_arm_right_pose,
+        follower_arm_left,
+        follower_arm_right,
+    )
+
+    return {
+        "qpos": qpos,
+        "eef_pose": eef_pose,
+        "images": {
+            config["camera_names"][0]: img_front,
+            config["camera_names"][1]: img_left,
+            config["camera_names"][2]: img_right,
+        },
+    }
+
+
+def get_inference_observation(args, config, ros_operator):
+    from ros_operator import get_ros_observation
+
+    return build_observation(get_ros_observation(args, ros_operator), config, ros_operator)
+
+
+def get_rollout_observation(args, config, ros_operator):
+    from ros_operator import get_latest_ros_observation
+
+    return build_observation(get_latest_ros_observation(args, ros_operator), config, ros_operator)
 
 
 def save_inference_data(args, timesteps, actions, dataset_path, success: bool = True):

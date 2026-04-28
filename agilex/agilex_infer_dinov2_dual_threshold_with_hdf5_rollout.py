@@ -257,19 +257,19 @@ def update_observation_window(args, config, ros_operator):
                 "eef_pose": None,
             })
 
-    img_front, img_left, img_right, puppet_arm_left, puppet_arm_right, puppet_arm_left_pose, puppet_arm_right_pose = (
+    img_front, img_left, img_right, follower_arm_left, follower_arm_right, follower_arm_left_pose, follower_arm_right_pose = (
         get_ros_observation(args, ros_operator)
     )
 
     qpos = np.concatenate(
-        (np.array(puppet_arm_left.position), np.array(puppet_arm_right.position)), axis=0,
+        (np.array(follower_arm_left.position), np.array(follower_arm_right.position)), axis=0,
     )
 
-    eef_pose = ros_operator.build_puppet_arm_pose(
-        puppet_arm_left_pose,
-        puppet_arm_right_pose,
-        puppet_arm_left,
-        puppet_arm_right,
+    eef_pose = ros_operator.build_follower_arm_pose(
+        follower_arm_left_pose,
+        follower_arm_right_pose,
+        follower_arm_left,
+        follower_arm_right,
     )
 
     with observation_window_lock:
@@ -518,7 +518,7 @@ def model_inference(args, config, ros_operator):
         f"cooldown {rescue_cooldown_steps} steps."
     )
 
-    ros_operator.puppet_arm_publish_continuous(left0, right0)
+    ros_operator.follower_arm_publish_continuous(left0, right0)
     print("Warmup servers...")
     policy.warmup()
     if sde_policy:
@@ -539,7 +539,7 @@ def model_inference(args, config, ros_operator):
 
             input("Press enter to start episode")
             task_time = time.time()
-            ros_operator.puppet_arm_publish_continuous(left0, right0)
+            ros_operator.follower_arm_publish_continuous(left0, right0)
 
             rescue_log: list = []
             dual_head_log: list = []
@@ -592,7 +592,7 @@ def model_inference(args, config, ros_operator):
                 if key == " ":
                     result = handle_interactive_mode(task_time)
                     if result == "reset":
-                        ros_operator.puppet_arm_publish_continuous(left0, right0)
+                        ros_operator.follower_arm_publish_continuous(left0, right0)
                         user_stopped = True
                         break
                     elif result == "quit":
@@ -772,10 +772,10 @@ def model_inference(args, config, ros_operator):
 
                 if args.ctrl_type == "joint":
                     left_action, right_action = process_action(config["task"], act)
-                    ros_operator.puppet_arm_publish(left_action, right_action)
+                    ros_operator.follower_arm_publish(left_action, right_action)
                 elif args.ctrl_type == "eef":
                     left_action, right_action = process_action(config["task"], act)
-                    ros_operator.puppet_arm_pose_publish(left_action, right_action)
+                    ros_operator.follower_arm_pose_publish(left_action, right_action)
                 last_published_action = np.asarray(act).copy()
 
                 if args.save_rollout:
@@ -871,10 +871,10 @@ def model_inference(args, config, ros_operator):
             logging.info(f"Episode {episode_idx} finished: {suffix}")
             logging.info(f"Rescue activations: {len(rescue_log)}")
             episode_idx += 1
-            ros_operator.puppet_arm_publish_continuous(left0, right0)
+            ros_operator.follower_arm_publish_continuous(left0, right0)
 
     finally:
-        ros_operator.puppet_arm_publish_continuous(left0, right0)
+        ros_operator.follower_arm_publish_continuous(left0, right0)
         try:
             cv2.destroyAllWindows()
         except Exception:
@@ -1088,14 +1088,14 @@ def get_arguments():
     parser.add_argument("--img_front_depth_topic", type=str, default="/camera_f/depth/image_raw")
     parser.add_argument("--img_left_depth_topic", type=str, default="/camera_l/depth/image_raw")
     parser.add_argument("--img_right_depth_topic", type=str, default="/camera_r/depth/image_raw")
-    parser.add_argument("--master_arm_left_topic", type=str, default="/master/joint_left")
-    parser.add_argument("--master_arm_right_topic", type=str, default="/master/joint_right")
-    parser.add_argument("--puppet_arm_left_topic", type=str, default="/puppet/joint_left")
-    parser.add_argument("--puppet_arm_right_topic", type=str, default="/puppet/joint_right")
+    parser.add_argument("--leader_arm_left_topic", type=str, default="/master/joint_left")
+    parser.add_argument("--leader_arm_right_topic", type=str, default="/master/joint_right")
+    parser.add_argument("--follower_arm_left_topic", type=str, default="/puppet/joint_left")
+    parser.add_argument("--follower_arm_right_topic", type=str, default="/puppet/joint_right")
     parser.add_argument("--pos_cmd_left_topic", type=str, default="/puppet/pos_cmd_left")
     parser.add_argument("--pos_cmd_right_topic", type=str, default="/puppet/pos_cmd_right")
-    parser.add_argument("--puppet_arm_left_pose_topic", type=str, default="/puppet/end_pose_euler_left")
-    parser.add_argument("--puppet_arm_right_pose_topic", type=str, default="/puppet/end_pose_euler_right")
+    parser.add_argument("--follower_arm_left_pose_topic", type=str, default="/puppet/end_pose_euler_left")
+    parser.add_argument("--follower_arm_right_pose_topic", type=str, default="/puppet/end_pose_euler_right")
     # ---- Inference ----
     parser.add_argument("--publish_rate", type=int, default=30)
     parser.add_argument("--chunk_size", type=int, default=50)

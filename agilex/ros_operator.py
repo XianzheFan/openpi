@@ -21,13 +21,13 @@ class RosOperator:
         self.mode = mode
         self.bridge = CvBridge()
 
-        self.puppet_arm_left_publisher = None
-        self.puppet_arm_right_publisher = None
-        self.puppet_arm_left_pose_publisher = None
-        self.puppet_arm_right_pose_publisher = None
-        self.puppet_arm_publish_thread = None
-        self.puppet_arm_publish_lock = threading.Lock()
-        self.puppet_arm_publish_lock.acquire()
+        self.follower_arm_left_publisher = None
+        self.follower_arm_right_publisher = None
+        self.follower_arm_left_pose_publisher = None
+        self.follower_arm_right_pose_publisher = None
+        self.follower_arm_publish_thread = None
+        self.follower_arm_publish_lock = threading.Lock()
+        self.follower_arm_publish_lock.acquire()
 
         self._init_queues()
         self.init_ros()
@@ -37,8 +37,8 @@ class RosOperator:
             "front_image_queue",
             "left_image_queue",
             "right_image_queue",
-            "puppet_left_arm_queue",
-            "puppet_right_arm_queue",
+            "follower_left_arm_queue",
+            "follower_right_arm_queue",
         ]
 
         if self.args.use_depth_image:
@@ -53,17 +53,17 @@ class RosOperator:
         if self.mode == "collection":
             queue_names.extend(
                 [
-                    "master_left_arm_queue",
-                    "master_right_arm_queue",
-                    "puppet_arm_left_pose_queue",
-                    "puppet_arm_right_pose_queue",
+                    "leader_left_arm_queue",
+                    "leader_right_arm_queue",
+                    "follower_arm_left_pose_queue",
+                    "follower_arm_right_pose_queue",
                 ]
             )
         else:
             queue_names.extend(
                 [
-                    "puppet_arm_left_pose_queue",
-                    "puppet_arm_right_pose_queue",
+                    "follower_arm_left_pose_queue",
+                    "follower_arm_right_pose_queue",
                 ]
             )
         return queue_names
@@ -167,22 +167,22 @@ class RosOperator:
             return None
         return "all_zero=" + ",".join(zero_fields)
 
-    def _build_single_arm_pose(self, puppet_arm_pose, puppet_arm_joint_state):
+    def _build_single_arm_pose(self, follower_arm_pose, follower_arm_joint_state):
         return np.array(
             [
-                puppet_arm_pose.x,
-                puppet_arm_pose.y,
-                puppet_arm_pose.z,
-                puppet_arm_pose.roll,
-                puppet_arm_pose.pitch,
-                puppet_arm_pose.yaw,
-                puppet_arm_joint_state.position[-1],
+                follower_arm_pose.x,
+                follower_arm_pose.y,
+                follower_arm_pose.z,
+                follower_arm_pose.roll,
+                follower_arm_pose.pitch,
+                follower_arm_pose.yaw,
+                follower_arm_joint_state.position[-1],
             ]
         )
 
-    def build_puppet_arm_pose(self, puppet_arm_left_pose, puppet_arm_right_pose, puppet_arm_left, puppet_arm_right):
-        left_pose = self._build_single_arm_pose(puppet_arm_left_pose, puppet_arm_left)
-        right_pose = self._build_single_arm_pose(puppet_arm_right_pose, puppet_arm_right)
+    def build_follower_arm_pose(self, follower_arm_left_pose, follower_arm_right_pose, follower_arm_left, follower_arm_right):
+        left_pose = self._build_single_arm_pose(follower_arm_left_pose, follower_arm_left)
+        right_pose = self._build_single_arm_pose(follower_arm_right_pose, follower_arm_right)
         return np.concatenate((left_pose, right_pose), axis=0)
 
     def _camera_queues(self):
@@ -202,12 +202,12 @@ class RosOperator:
             "img_front": self.front_image_queue,
             "img_left": self.left_image_queue,
             "img_right": self.right_image_queue,
-            "master_arm_left": self.master_left_arm_queue,
-            "master_arm_right": self.master_right_arm_queue,
-            "puppet_arm_left": self.puppet_left_arm_queue,
-            "puppet_arm_right": self.puppet_right_arm_queue,
-            "puppet_arm_left_pose": self.puppet_arm_left_pose_queue,
-            "puppet_arm_right_pose": self.puppet_arm_right_pose_queue,
+            "leader_arm_left": self.leader_left_arm_queue,
+            "leader_arm_right": self.leader_right_arm_queue,
+            "follower_arm_left": self.follower_left_arm_queue,
+            "follower_arm_right": self.follower_right_arm_queue,
+            "follower_arm_left_pose": self.follower_arm_left_pose_queue,
+            "follower_arm_right_pose": self.follower_arm_right_pose_queue,
         }
         if self.args.use_depth_image:
             stream_map.update(
@@ -224,10 +224,10 @@ class RosOperator:
             "img_front": self.front_image_queue,
             "img_left": self.left_image_queue,
             "img_right": self.right_image_queue,
-            "puppet_arm_left": self.puppet_left_arm_queue,
-            "puppet_arm_right": self.puppet_right_arm_queue,
-            "puppet_arm_left_pose": self.puppet_arm_left_pose_queue,
-            "puppet_arm_right_pose": self.puppet_arm_right_pose_queue,
+            "follower_arm_left": self.follower_left_arm_queue,
+            "follower_arm_right": self.follower_right_arm_queue,
+            "follower_arm_left_pose": self.follower_arm_left_pose_queue,
+            "follower_arm_right_pose": self.follower_arm_right_pose_queue,
         }
         if self.args.use_depth_image:
             stream_map.update(
@@ -251,12 +251,12 @@ class RosOperator:
         img_front = self._pop_synced_image(self.front_image_queue, frame_time)
         img_left = self._pop_synced_image(self.left_image_queue, frame_time)
         img_right = self._pop_synced_image(self.right_image_queue, frame_time)
-        master_arm_left = self._pop_synced_message(self.master_left_arm_queue, frame_time)
-        master_arm_right = self._pop_synced_message(self.master_right_arm_queue, frame_time)
-        puppet_arm_left = self._pop_synced_message(self.puppet_left_arm_queue, frame_time)
-        puppet_arm_right = self._pop_synced_message(self.puppet_right_arm_queue, frame_time)
-        _, puppet_arm_left_pose = self._pop_synced_message(self.puppet_arm_left_pose_queue, frame_time)
-        _, puppet_arm_right_pose = self._pop_synced_message(self.puppet_arm_right_pose_queue, frame_time)
+        leader_arm_left = self._pop_synced_message(self.leader_left_arm_queue, frame_time)
+        leader_arm_right = self._pop_synced_message(self.leader_right_arm_queue, frame_time)
+        follower_arm_left = self._pop_synced_message(self.follower_left_arm_queue, frame_time)
+        follower_arm_right = self._pop_synced_message(self.follower_right_arm_queue, frame_time)
+        _, follower_arm_left_pose = self._pop_synced_message(self.follower_arm_left_pose_queue, frame_time)
+        _, follower_arm_right_pose = self._pop_synced_message(self.follower_arm_right_pose_queue, frame_time)
 
         img_front_depth = None
         img_left_depth = None
@@ -276,12 +276,12 @@ class RosOperator:
                 img_front_depth,
                 img_left_depth,
                 img_right_depth,
-                puppet_arm_left,
-                puppet_arm_right,
-                puppet_arm_left_pose,
-                puppet_arm_right_pose,
-                master_arm_left,
-                master_arm_right,
+                follower_arm_left,
+                follower_arm_right,
+                follower_arm_left_pose,
+                follower_arm_right_pose,
+                leader_arm_left,
+                leader_arm_right,
             ),
         )
 
@@ -297,10 +297,10 @@ class RosOperator:
         img_front = self._pop_synced_image(self.front_image_queue, frame_time)
         img_left = self._pop_synced_image(self.left_image_queue, frame_time)
         img_right = self._pop_synced_image(self.right_image_queue, frame_time)
-        puppet_arm_left = self._pop_synced_message(self.puppet_left_arm_queue, frame_time)
-        puppet_arm_right = self._pop_synced_message(self.puppet_right_arm_queue, frame_time)
-        _, puppet_arm_left_pose = self._pop_synced_message(self.puppet_arm_left_pose_queue, frame_time)
-        _, puppet_arm_right_pose = self._pop_synced_message(self.puppet_arm_right_pose_queue, frame_time)
+        follower_arm_left = self._pop_synced_message(self.follower_left_arm_queue, frame_time)
+        follower_arm_right = self._pop_synced_message(self.follower_right_arm_queue, frame_time)
+        _, follower_arm_left_pose = self._pop_synced_message(self.follower_arm_left_pose_queue, frame_time)
+        _, follower_arm_right_pose = self._pop_synced_message(self.follower_arm_right_pose_queue, frame_time)
 
         img_front_depth = None
         img_left_depth = None
@@ -319,10 +319,10 @@ class RosOperator:
                 img_front_depth,
                 img_left_depth,
                 img_right_depth,
-                puppet_arm_left,
-                puppet_arm_right,
-                puppet_arm_left_pose,
-                puppet_arm_right_pose,
+                follower_arm_left,
+                follower_arm_right,
+                follower_arm_left_pose,
+                follower_arm_right_pose,
             ),
         )
 
@@ -334,10 +334,10 @@ class RosOperator:
         img_front = self._peek_latest_image(self.front_image_queue)
         img_left = self._peek_latest_image(self.left_image_queue)
         img_right = self._peek_latest_image(self.right_image_queue)
-        puppet_arm_left = self._peek_latest_message(self.puppet_left_arm_queue)
-        puppet_arm_right = self._peek_latest_message(self.puppet_right_arm_queue)
-        _, puppet_arm_left_pose = self._peek_latest_message(self.puppet_arm_left_pose_queue)
-        _, puppet_arm_right_pose = self._peek_latest_message(self.puppet_arm_right_pose_queue)
+        follower_arm_left = self._peek_latest_message(self.follower_left_arm_queue)
+        follower_arm_right = self._peek_latest_message(self.follower_right_arm_queue)
+        _, follower_arm_left_pose = self._peek_latest_message(self.follower_arm_left_pose_queue)
+        _, follower_arm_right_pose = self._peek_latest_message(self.follower_arm_right_pose_queue)
 
         img_front_depth = None
         img_left_depth = None
@@ -356,10 +356,10 @@ class RosOperator:
                 img_front_depth,
                 img_left_depth,
                 img_right_depth,
-                puppet_arm_left,
-                puppet_arm_right,
-                puppet_arm_left_pose,
-                puppet_arm_right_pose,
+                follower_arm_left,
+                follower_arm_right,
+                follower_arm_left_pose,
+                follower_arm_right_pose,
             ),
         )
 
@@ -376,8 +376,8 @@ class RosOperator:
             (self.args.img_front_topic, Image, self._make_queue_callback("front_image_queue")),
             (self.args.img_left_topic, Image, self._make_queue_callback("left_image_queue")),
             (self.args.img_right_topic, Image, self._make_queue_callback("right_image_queue")),
-            (self.args.puppet_arm_left_topic, JointState, self._make_queue_callback("puppet_left_arm_queue")),
-            (self.args.puppet_arm_right_topic, JointState, self._make_queue_callback("puppet_right_arm_queue")),
+            (self.args.follower_arm_left_topic, JointState, self._make_queue_callback("follower_left_arm_queue")),
+            (self.args.follower_arm_right_topic, JointState, self._make_queue_callback("follower_right_arm_queue")),
         ]
         if self.args.use_depth_image:
             subscriber_specs.extend(
@@ -391,17 +391,17 @@ class RosOperator:
         if self.mode == "collection":
             subscriber_specs.extend(
                 [
-                    (self.args.master_arm_left_topic, JointState, self._make_queue_callback("master_left_arm_queue")),
-                    (self.args.master_arm_right_topic, JointState, self._make_queue_callback("master_right_arm_queue")),
+                    (self.args.leader_arm_left_topic, JointState, self._make_queue_callback("leader_left_arm_queue")),
+                    (self.args.leader_arm_right_topic, JointState, self._make_queue_callback("leader_right_arm_queue")),
                     (
-                        self.args.puppet_arm_left_pose_topic,
+                        self.args.follower_arm_left_pose_topic,
                         PosCmd,
-                        self._make_queue_callback("puppet_arm_left_pose_queue", True),
+                        self._make_queue_callback("follower_arm_left_pose_queue", True),
                     ),
                     (
-                        self.args.puppet_arm_right_pose_topic,
+                        self.args.follower_arm_right_pose_topic,
                         PosCmd,
-                        self._make_queue_callback("puppet_arm_right_pose_queue", True),
+                        self._make_queue_callback("follower_arm_right_pose_queue", True),
                     ),
                 ]
             )
@@ -409,14 +409,14 @@ class RosOperator:
             subscriber_specs.extend(
                 [
                     (
-                        self.args.puppet_arm_left_pose_topic,
+                        self.args.follower_arm_left_pose_topic,
                         PosCmd,
-                        self._make_queue_callback("puppet_arm_left_pose_queue", True),
+                        self._make_queue_callback("follower_arm_left_pose_queue", True),
                     ),
                     (
-                        self.args.puppet_arm_right_pose_topic,
+                        self.args.follower_arm_right_pose_topic,
                         PosCmd,
-                        self._make_queue_callback("puppet_arm_right_pose_queue", True),
+                        self._make_queue_callback("follower_arm_right_pose_queue", True),
                     ),
                 ]
             )
@@ -424,12 +424,12 @@ class RosOperator:
         self._register_subscribers(subscriber_specs)
 
         if self.mode == "inference":
-            self.puppet_arm_left_publisher = rospy.Publisher(self.args.master_arm_left_topic, JointState, queue_size=10)
-            self.puppet_arm_right_publisher = rospy.Publisher(
-                self.args.master_arm_right_topic, JointState, queue_size=10
+            self.follower_arm_left_publisher = rospy.Publisher(self.args.leader_arm_left_topic, JointState, queue_size=10)
+            self.follower_arm_right_publisher = rospy.Publisher(
+                self.args.leader_arm_right_topic, JointState, queue_size=10
             )
-            self.puppet_arm_left_pose_publisher = rospy.Publisher(self.args.pos_cmd_left_topic, PosCmd, queue_size=10)
-            self.puppet_arm_right_pose_publisher = rospy.Publisher(self.args.pos_cmd_right_topic, PosCmd, queue_size=10)
+            self.follower_arm_left_pose_publisher = rospy.Publisher(self.args.pos_cmd_left_topic, PosCmd, queue_size=10)
+            self.follower_arm_right_pose_publisher = rospy.Publisher(self.args.pos_cmd_right_topic, PosCmd, queue_size=10)
 
     def process(self, keyboard_handler):
         """
@@ -479,12 +479,12 @@ class RosOperator:
                 img_front_depth,
                 img_left_depth,
                 img_right_depth,
-                puppet_arm_left,
-                puppet_arm_right,
-                puppet_arm_left_pose,
-                puppet_arm_right_pose,
-                master_arm_left,
-                master_arm_right,
+                follower_arm_left,
+                follower_arm_right,
+                follower_arm_left_pose,
+                follower_arm_right_pose,
+                leader_arm_left,
+                leader_arm_right,
             ) = result
 
             observation = {
@@ -501,23 +501,23 @@ class RosOperator:
                     self.args.camera_names[2]: img_right_depth,
                 }
 
-            qpos = np.concatenate((np.array(puppet_arm_left.position), np.array(puppet_arm_right.position)), axis=0)
-            qvel = np.concatenate((np.array(puppet_arm_left.velocity), np.array(puppet_arm_right.velocity)), axis=0)
-            effort = np.concatenate((np.array(puppet_arm_left.effort), np.array(puppet_arm_right.effort)), axis=0)
-            action = np.concatenate((np.array(master_arm_left.position), np.array(master_arm_right.position)), axis=0)
-            eef_pose = self.build_puppet_arm_pose(
-                puppet_arm_left_pose,
-                puppet_arm_right_pose,
-                puppet_arm_left,
-                puppet_arm_right,
+            qpos = np.concatenate((np.array(follower_arm_left.position), np.array(follower_arm_right.position)), axis=0)
+            qvel = np.concatenate((np.array(follower_arm_left.velocity), np.array(follower_arm_right.velocity)), axis=0)
+            effort = np.concatenate((np.array(follower_arm_left.effort), np.array(follower_arm_right.effort)), axis=0)
+            action = np.concatenate((np.array(leader_arm_left.position), np.array(leader_arm_right.position)), axis=0)
+            eef_pose = self.build_follower_arm_pose(
+                follower_arm_left_pose,
+                follower_arm_right_pose,
+                follower_arm_left,
+                follower_arm_right,
             )
 
             zero_value_error = self._format_zero_value_failure(
                 [
-                    ("puppet_arm_left.position", np.array(puppet_arm_left.position)),
-                    ("puppet_arm_right.position", np.array(puppet_arm_right.position)),
-                    ("master_arm_left.position", np.array(master_arm_left.position)),
-                    ("master_arm_right.position", np.array(master_arm_right.position)),
+                    ("follower_arm_left.position", np.array(follower_arm_left.position)),
+                    ("follower_arm_right.position", np.array(follower_arm_right.position)),
+                    ("leader_arm_left.position", np.array(leader_arm_left.position)),
+                    ("leader_arm_right.position", np.array(leader_arm_right.position)),
                 ]
             )
             if zero_value_error:
@@ -563,37 +563,37 @@ class RosOperator:
         print("len(actions)  : ", len(actions))
         return timesteps, actions, "q"
 
-    def puppet_arm_publish(self, left_joint_positions, right_joint_positions):
+    def follower_arm_publish(self, left_joint_positions, right_joint_positions):
         joint_state_msg = JointState()
         joint_state_msg.header = Header()
         joint_state_msg.header.stamp = rospy.Time.now()
         joint_state_msg.name = ["joint0", "joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
         joint_state_msg.position = left_joint_positions
-        self.puppet_arm_left_publisher.publish(joint_state_msg)
+        self.follower_arm_left_publisher.publish(joint_state_msg)
         joint_state_msg.position = right_joint_positions
-        self.puppet_arm_right_publisher.publish(joint_state_msg)
+        self.follower_arm_right_publisher.publish(joint_state_msg)
 
-    def puppet_arm_pose_publish(self, left_pose, right_pose):
+    def follower_arm_pose_publish(self, left_pose, right_pose):
         pose_msg = PosCmd()
         pose_msg.x, pose_msg.y, pose_msg.z = left_pose[:3]
         pose_msg.roll, pose_msg.pitch, pose_msg.yaw = left_pose[3:6]
         pose_msg.gripper = left_pose[6]
-        self.puppet_arm_left_pose_publisher.publish(pose_msg)
+        self.follower_arm_left_pose_publisher.publish(pose_msg)
 
         pose_msg.x, pose_msg.y, pose_msg.z = right_pose[:3]
         pose_msg.roll, pose_msg.pitch, pose_msg.yaw = right_pose[3:6]
         pose_msg.gripper = right_pose[6]
-        self.puppet_arm_right_pose_publisher.publish(pose_msg)
+        self.follower_arm_right_pose_publisher.publish(pose_msg)
 
-    def puppet_arm_publish_continuous(self, left_joint_positions, right_joint_positions):
+    def follower_arm_publish_continuous(self, left_joint_positions, right_joint_positions):
         rate = rospy.Rate(self.args.publish_rate)
         current_left_arm = None
         current_right_arm = None
         while not rospy.is_shutdown():
-            if len(self.puppet_left_arm_queue) != 0:
-                current_left_arm = list(self.puppet_left_arm_queue[-1].position)
-            if len(self.puppet_right_arm_queue) != 0:
-                current_right_arm = list(self.puppet_right_arm_queue[-1].position)
+            if len(self.follower_left_arm_queue) != 0:
+                current_left_arm = list(self.follower_left_arm_queue[-1].position)
+            if len(self.follower_right_arm_queue) != 0:
+                current_right_arm = list(self.follower_right_arm_queue[-1].position)
             if current_left_arm is None or current_right_arm is None:
                 rate.sleep()
                 continue
@@ -608,7 +608,7 @@ class RosOperator:
         moving = True
         step = 0
         while moving and not rospy.is_shutdown():
-            if self.puppet_arm_publish_lock.acquire(False):
+            if self.follower_arm_publish_lock.acquire(False):
                 return
             left_diff = [abs(left_joint_positions[i] - current_left_arm[i]) for i in range(len(left_joint_positions))]
             right_diff = [
@@ -627,9 +627,9 @@ class RosOperator:
                 else:
                     current_right_arm[i] += right_direction[i] * self.args.arm_steps_length[i]
                     moving = True
-            self.puppet_arm_publish(current_left_arm, current_right_arm)
+            self.follower_arm_publish(current_left_arm, current_right_arm)
             step += 1
-            print("puppet_arm_publish_continuous:", step)
+            print("follower_arm_publish_continuous:", step)
             rate.sleep()
 
 
@@ -654,19 +654,19 @@ def get_ros_observation(args, ros_operator):
             img_front_depth,
             img_left_depth,
             img_right_depth,
-            puppet_arm_left,
-            puppet_arm_right,
-            puppet_arm_left_pose,
-            puppet_arm_right_pose,
+            follower_arm_left,
+            follower_arm_right,
+            follower_arm_left_pose,
+            follower_arm_right_pose,
         ) = frame_or_error
         return (
             img_front,
             img_left,
             img_right,
-            puppet_arm_left,
-            puppet_arm_right,
-            puppet_arm_left_pose,
-            puppet_arm_right_pose,
+            follower_arm_left,
+            follower_arm_right,
+            follower_arm_left_pose,
+            follower_arm_right_pose,
         )
 
 
@@ -690,17 +690,17 @@ def get_latest_ros_observation(args, ros_operator):
             img_front_depth,
             img_left_depth,
             img_right_depth,
-            puppet_arm_left,
-            puppet_arm_right,
-            puppet_arm_left_pose,
-            puppet_arm_right_pose,
+            follower_arm_left,
+            follower_arm_right,
+            follower_arm_left_pose,
+            follower_arm_right_pose,
         ) = frame_or_error
         return (
             img_front,
             img_left,
             img_right,
-            puppet_arm_left,
-            puppet_arm_right,
-            puppet_arm_left_pose,
-            puppet_arm_right_pose,
+            follower_arm_left,
+            follower_arm_right,
+            follower_arm_left_pose,
+            follower_arm_right_pose,
         )
