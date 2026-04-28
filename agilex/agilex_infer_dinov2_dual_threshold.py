@@ -690,6 +690,10 @@ def model_inference(args, config, ros_operator):
                 max_workers=1, thread_name_prefix="rescue",
             )
             pending_rescue: dict | None = None
+            # Counter for chained manual rescues: when 's' is pressed and
+            # --manual_rescue_repeat > 1, we auto-retrigger another rescue
+            # right after the previous chunk finishes playing.
+            manual_rescue_remaining: int = 0
             # Hold window after pressing 's': keeps the arm at the action
             # that was being published when the rescue was submitted, so the
             # operator has a few seconds to react and (optionally) take over
@@ -714,11 +718,41 @@ def model_inference(args, config, ros_operator):
                             return
                     elif key == "s":
                         manual_rescue_pressed = True
-                        print("\n\033[93m>>> [System] Key 's' detected! Manually triggering SDE + DreamDojo rescue mechanism!\033[0m", flush=True)
+                        # The current press counts as the first rescue; queue
+                        # up the rest (if --manual_rescue_repeat > 1) so they
+                        # auto-fire after each previous chunk plays out.
+                        manual_rescue_remaining = max(0, int(args.manual_rescue_repeat) - 1)
+                        if manual_rescue_remaining > 0:
+                            print(
+                                f"\n\033[93m>>> [System] Key 's' detected! Manually triggering "
+                                f"SDE + DreamDojo rescue mechanism! "
+                                f"(will chain {manual_rescue_remaining} more rescue(s) after this one)\033[0m",
+                                flush=True,
+                            )
+                        else:
+                            print("\n\033[93m>>> [System] Key 's' detected! Manually triggering SDE + DreamDojo rescue mechanism!\033[0m", flush=True)
                     elif args.dagger_mode and key in DAGGER_KEYS:
                         dagger_keys.append(key)
                 if user_stopped:
                     break
+
+                # Auto-chain follow-up manual rescues: fire only once the
+                # previous rescue chunk has fully played out and there is no
+                # in-flight DreamDojo job. Each follow-up uses a fresh
+                # obs_snapshot captured later in this same loop iteration.
+                if (
+                    not manual_rescue_pressed
+                    and manual_rescue_remaining > 0
+                    and pending_rescue is None
+                    and frame_counter > rescue_active_until_frame
+                ):
+                    manual_rescue_pressed = True
+                    manual_rescue_remaining -= 1
+                    print(
+                        f"\n\033[93m>>> [System] Auto-chaining manual rescue "
+                        f"({manual_rescue_remaining} more after this)\033[0m",
+                        flush=True,
+                    )
 
                 # Capture current frame for rollout video + clip buffer.
                 front_msg = (
@@ -1593,6 +1627,12 @@ def get_arguments():
                              "inject. Gives the operator time to take over "
                              "with DAgger keys. Auto rescues do not freeze. "
                              "Set to 0 to disable.")
+    parser.add_argument("--manual_rescue_repeat", type=int, default=2,
+                        help="Number of consecutive rescue chunks to launch "
+                             "from a single 's' keypress. Each follow-up "
+                             "rescue is queued automatically right after the "
+                             "previous chunk finishes playing, using a fresh "
+                             "observation snapshot. 1 = legacy single-shot.")
 
     return parser.parse_args()
 
