@@ -3,6 +3,7 @@ assets/
 checkpoints/
 data/
 wandb/
+agilex/dream_trigger/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
