@@ -863,16 +863,28 @@ def model_inference(args, config, ros_operator):
                     if clip_buffer is not None and front_img_now is not None:
                         clip_buffer.update(front_img_now, right_img_now, left_img_now)
 
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _dh_t0 = time.perf_counter()
                     if clip_buffer is not None and clip_buffer.ready():
                         top_c, right_c, left_c = clip_buffer.clips()
                         progress_p, success_p = dual_head.predict(
                             top_c, right_c, left_c, switch_state,
                         )
+                        _dh_mode = f"clip(N={len(top_c)})"
                     else:
                         progress_p, success_p = dual_head.predict(
                             obs_snapshot["top"], obs_snapshot["right"],
                             obs_snapshot["left"], switch_state,
                         )
+                        _dh_mode = "single"
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    _dh_ms = (time.perf_counter() - _dh_t0) * 1000.0
+                    print(
+                        f"[DualHead] inference time: {_dh_ms:.2f} ms ({_dh_mode})",
+                        flush=True,
+                    )
 
                     time_fraction = t / max(max_publish_step - 1, 1)
                     auto_triggered, reasons, info = checker.add_and_check(

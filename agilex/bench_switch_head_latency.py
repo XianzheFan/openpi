@@ -1,8 +1,8 @@
-"""Benchmark the standalone DINOv2SwitchHead inference latency.
+"""Benchmark the DINOv2 switch-head inference latency (single or dual head).
 
-Mirrors the call site in agilex_infer_dinov2_value_switch.py:
-  StandaloneSwitchHead.predict(top_clip, right_clip, left_clip, state)
-where each clip is a list of 20 (H, W, 3) uint8 frames.
+Mirrors the call site in agilex_infer_dinov2_value_switch / dual_threshold:
+  head.predict(top_clip, right_clip, left_clip, state)
+where each clip is a list of `clip_len` (H, W, 3) uint8 frames.
 """
 
 import argparse
@@ -14,19 +14,28 @@ import numpy as np
 import torch
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from train_switch_head_robometer import DINOv2SwitchHead
 
 
 class StandaloneSwitchHead:
-    """Inline copy of agilex_infer_dinov2_value_switch.StandaloneSwitchHead."""
+    """Wraps either DINOv2SwitchHead (single) or DINOv2DualHead (progress+success)."""
 
     def __init__(self, checkpoint_path, dinov2_model="dinov2_vitb14",
-                 hidden_dim=256, state_dim=14, num_cameras=3, device=None):
+                 hidden_dim=256, state_dim=14, num_cameras=3, device=None,
+                 dual=False):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        self.model = DINOv2SwitchHead(
-            dinov2_model=dinov2_model, hidden_dim=hidden_dim,
-            state_dim=state_dim, num_cameras=num_cameras, freeze_backbone=True,
-        )
+        self.dual = dual
+        if dual:
+            from train_switch_head_dual import DINOv2DualHead
+            self.model = DINOv2DualHead(
+                dinov2_model=dinov2_model, hidden_dim=hidden_dim,
+                state_dim=state_dim, num_cameras=num_cameras, freeze_backbone=True,
+            )
+        else:
+            from train_switch_head_robometer import DINOv2SwitchHead
+            self.model = DINOv2SwitchHead(
+                dinov2_model=dinov2_model, hidden_dim=hidden_dim,
+                state_dim=state_dim, num_cameras=num_cameras, freeze_backbone=True,
+            )
         sd = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
         self.model.load_state_dict(sd)
         self.model.to(self.device).eval()
@@ -44,18 +53,20 @@ class StandaloneSwitchHead:
                 t = self._frame_to_tensor(cam).unsqueeze(0)
             images.append(t.to(self.device))
         state_t = torch.from_numpy(state_np.astype(np.float32)).unsqueeze(0).to(self.device)
-        prob = self.model.predict_switch_prob(images, state_t)
-        return float(prob.item())
+        if self.dual:
+            return self.model.predict(images, state_t)
+        return self.model.predict_switch_prob(images, state_t)
 
 
 def run(ckpt: str, clip_len: int, h: int, w: int, warmup: int, iters: int,
-        use_clip: bool, dinov2_model: str):
+        use_clip: bool, dinov2_model: str, dual: bool):
     head = StandaloneSwitchHead(
         checkpoint_path=ckpt,
         dinov2_model=dinov2_model,
         hidden_dim=256,
         state_dim=14,
         num_cameras=3,
+        dual=dual,
     )
 
     rng = np.random.default_rng(0)
@@ -87,7 +98,8 @@ def run(ckpt: str, clip_len: int, h: int, w: int, warmup: int, iters: int,
 
     arr = np.asarray(times_ms)
     mode = f"clip_len={clip_len}" if use_clip else "single-frame"
-    print(f"\n=== Switch head latency ({mode}, {dinov2_model}, {h}x{w}) ===")
+    head_kind = "dual" if dual else "single"
+    print(f"\n=== Switch head latency ({head_kind}, {mode}, {dinov2_model}, {h}x{w}) ===")
     print(f"  iters       : {iters} (warmup {warmup})")
     print(f"  mean        : {arr.mean():.2f} ms")
     print(f"  median      : {np.median(arr):.2f} ms")
@@ -102,6 +114,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--switch_head_ckpt", type=str,
                    default="agilex/checkpoints/switch_head_robometer/best_model.pt")
+    p.add_argument("--dual", action="store_true",
+                   help="Benchmark DINOv2DualHead (progress+success) instead of single-head.")
     p.add_argument("--dinov2_model", type=str, default="dinov2_vitb14")
     p.add_argument("--clip_len", type=int, default=20)
     p.add_argument("--height", type=int, default=480)
@@ -113,11 +127,13 @@ def main():
     args = p.parse_args()
 
     run(args.switch_head_ckpt, args.clip_len, args.height, args.width,
-        args.warmup, args.iters, use_clip=True, dinov2_model=args.dinov2_model)
+        args.warmup, args.iters, use_clip=True, dinov2_model=args.dinov2_model,
+        dual=args.dual)
 
     if args.also_single_frame:
         run(args.switch_head_ckpt, args.clip_len, args.height, args.width,
-            args.warmup, args.iters, use_clip=False, dinov2_model=args.dinov2_model)
+            args.warmup, args.iters, use_clip=False, dinov2_model=args.dinov2_model,
+            dual=args.dual)
 
 
 if __name__ == "__main__":
