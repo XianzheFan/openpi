@@ -1317,7 +1317,7 @@ def _annotate_rescue_frames(frames: list, rescue_log: list, window: int) -> list
 
             is_manual = "manual_keyboard_override" in active_reasons
             color = (114, 255, 193) if is_manual else (0, 0, 255)
-            prefix = "DREAM TRIGGER" if is_manual else "RESCUE"
+            prefix = "CRITICAL PHASE" if is_manual else "RESCUE"
 
             cv2.rectangle(img, (0, 0), (w - 1, h - 1), color, 4)
 
