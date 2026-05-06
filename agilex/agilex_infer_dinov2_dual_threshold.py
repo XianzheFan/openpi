@@ -667,6 +667,7 @@ def model_inference(args, config, ros_operator):
             action_buffer_source = "ode"
             last_rescue_check_t = -rescue_check_stride
             last_rescue_trigger_t = -10 ** 9
+            rescue_submitted_count = 0
             last_published_action: np.ndarray | None = None
             latest_dual_progress: float = 0.0
             latest_dual_success: float = 0.0
@@ -827,14 +828,27 @@ def model_inference(args, config, ros_operator):
                     pending_rescue is not None
                     and not pending_rescue["future"].done()
                 )
+                rescue_cap_reached = (
+                    args.max_rescues_per_episode > 0
+                    and rescue_submitted_count >= args.max_rescues_per_episode
+                )
                 should_check_auto = (
                     can_switch
                     and not dagger_engaged
                     and not rescue_in_flight
+                    and not rescue_cap_reached
                     and frame_counter > 0
                     and (t - last_rescue_check_t) >= rescue_check_stride
                     and (t - last_rescue_trigger_t) >= rescue_cooldown_steps
                 )
+                if rescue_cap_reached and manual_rescue_pressed:
+                    print(
+                        f"\n\033[93m>>> [Rescue] cap reached "
+                        f"({rescue_submitted_count}/{args.max_rescues_per_episode}) — "
+                        f"'s' ignored.\033[0m",
+                        flush=True,
+                    )
+                    manual_rescue_pressed = False
                 if dagger_engaged and manual_rescue_pressed:
                     print(
                         "\n\033[96m>>> [DAgger] 's' ignored — release with 'r' "
@@ -982,6 +996,14 @@ def model_inference(args, config, ros_operator):
                         # Cooldown is gated from submission time so we don't
                         # double-submit while DreamDojo is still working.
                         last_rescue_trigger_t = t
+                        rescue_submitted_count += 1
+                        if args.max_rescues_per_episode > 0:
+                            print(
+                                f"\033[93m>>> [Rescue] submitted "
+                                f"{rescue_submitted_count}/{args.max_rescues_per_episode} "
+                                f"for this episode.\033[0m",
+                                flush=True,
+                            )
 
                         # s-hold only matters in dagger_mode (async). It
                         # freezes the arm so the operator has time to take
@@ -1554,6 +1576,10 @@ def get_arguments():
     parser.add_argument("--rescue_cooldown_frac", type=float, default=1.0,
                         help="After a rescue fires, skip new rescue checks for "
                              "chunk_size × this many publish steps (default 1 chunk).")
+    parser.add_argument("--max_rescues_per_episode", type=int, default=0,
+                        help="Hard cap on rescue submissions per episode. 0 = unlimited "
+                             "(default). Set to 1 to fire DreamDojo at most once per "
+                             "episode; further triggers (auto or manual) are silently ignored.")
     parser.add_argument("--rescue_blend_steps", type=int, default=5,
                         help="Linearly blend the first K SDE actions toward the "
                              "last published action so the injection is C0 "
