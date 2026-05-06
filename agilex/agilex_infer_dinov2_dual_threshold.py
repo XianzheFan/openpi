@@ -637,6 +637,8 @@ def model_inference(args, config, ros_operator):
             dual_head_log: list = []
             value_selections: list = []
             collected_frames: list = []
+            collected_left_frames: list = []
+            collected_right_frames: list = []
             frame_counter = 0
 
             clip_buffer = (
@@ -768,18 +770,25 @@ def model_inference(args, config, ros_operator):
                 )
                 if front_msg is not None:
                     front_img = ros_operator.bridge.imgmsg_to_cv2(front_msg, "passthrough")
+                    right_msg = (
+                        ros_operator.right_image_queue[-1]
+                        if len(ros_operator.right_image_queue) > 0 else None
+                    )
+                    left_msg = (
+                        ros_operator.left_image_queue[-1]
+                        if len(ros_operator.left_image_queue) > 0 else None
+                    )
+                    right_img = (
+                        ros_operator.bridge.imgmsg_to_cv2(right_msg, "passthrough")
+                        if right_msg is not None else None
+                    )
+                    left_img = (
+                        ros_operator.bridge.imgmsg_to_cv2(left_msg, "passthrough")
+                        if left_msg is not None else None
+                    )
                     frame_counter += 1
                     rescue_active_now = frame_counter <= rescue_active_until_frame
                     hud_frame = np.ascontiguousarray(np.asarray(front_img).copy())
-                    if latest_dual_valid:
-                        _draw_dualhead_hud(
-                            hud_frame,
-                            latest_dual_progress,
-                            latest_dual_success,
-                            latest_dual_tf,
-                            latest_dual_reasons,
-                            rescue_active_now,
-                        )
                     if args.show_live_window:
                         try:
                             cv2.imshow("dualhead", hud_frame[..., ::-1])
@@ -787,19 +796,21 @@ def model_inference(args, config, ros_operator):
                         except Exception as e:
                             logging.warning(f"[HUD] cv2.imshow failed: {e}")
                     collected_frames.append(hud_frame)
-                    if clip_buffer is not None:
-                        right_msg = (
-                            ros_operator.right_image_queue[-1]
-                            if len(ros_operator.right_image_queue) > 0 else None
+                    h, w = hud_frame.shape[:2]
+                    if left_img is not None:
+                        collected_left_frames.append(
+                            np.ascontiguousarray(np.asarray(left_img).copy())
                         )
-                        left_msg = (
-                            ros_operator.left_image_queue[-1]
-                            if len(ros_operator.left_image_queue) > 0 else None
+                    else:
+                        collected_left_frames.append(np.zeros((h, w, 3), dtype=np.uint8))
+                    if right_img is not None:
+                        collected_right_frames.append(
+                            np.ascontiguousarray(np.asarray(right_img).copy())
                         )
-                        if right_msg is not None and left_msg is not None:
-                            right_img = ros_operator.bridge.imgmsg_to_cv2(right_msg, "passthrough")
-                            left_img = ros_operator.bridge.imgmsg_to_cv2(left_msg, "passthrough")
-                            clip_buffer.update(front_img, right_img, left_img)
+                    else:
+                        collected_right_frames.append(np.zeros((h, w, 3), dtype=np.uint8))
+                    if clip_buffer is not None and right_img is not None and left_img is not None:
+                        clip_buffer.update(front_img, right_img, left_img)
 
                 # ----- Rescue check at fixed interval (independent of chunk boundary) -----
                 # While the human is in DAgger override, skip rescue entirely:
@@ -1233,6 +1244,24 @@ def model_inference(args, config, ros_operator):
                     annotated,
                     fps=ROLLOUT_FPS,
                 )
+            if collected_left_frames:
+                annotated_left = _annotate_rescue_frames(
+                    collected_left_frames, rescue_log, window=chunk_size,
+                )
+                imageio.mimwrite(
+                    str(final_dir / "complete_video_left.mp4"),
+                    annotated_left,
+                    fps=ROLLOUT_FPS,
+                )
+            if collected_right_frames:
+                annotated_right = _annotate_rescue_frames(
+                    collected_right_frames, rescue_log, window=chunk_size,
+                )
+                imageio.mimwrite(
+                    str(final_dir / "complete_video_right.mp4"),
+                    annotated_right,
+                    fps=ROLLOUT_FPS,
+                )
 
             logging.info(f"Episode {episode_idx} finished: {suffix}")
             logging.info(f"Rescue activations: {len(rescue_log)}")
@@ -1245,50 +1274,6 @@ def model_inference(args, config, ros_operator):
             cv2.destroyAllWindows()
         except Exception:
             pass
-
-
-def _draw_dualhead_hud(
-    img: np.ndarray,
-    progress: float,
-    success: float,
-    time_fraction: float,
-    reasons: list,
-    rescue_active: bool,
-) -> np.ndarray:
-    """Draw a persistent bottom-left HUD with the latest dual-head scores.
-
-    Modifies ``img`` in place and returns it.
-    """
-    h, _w = img.shape[:2]
-
-    is_manual = rescue_active and ("manual_keyboard_override" in reasons)
-
-    if is_manual:
-        main_color = (0, 165, 255)
-    elif rescue_active:
-        main_color = (0, 0, 255)
-    else:
-        main_color = (0, 220, 0)
-
-    main_txt = f"p={progress:.2f}  s={success:.2f}  tf={time_fraction:.2f}"
-    y = h - 16
-    cv2.putText(img, main_txt, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (0, 0, 0), 4, cv2.LINE_AA)
-    cv2.putText(img, main_txt, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                main_color, 2, cv2.LINE_AA)
-    sub = ""
-    if rescue_active:
-        sub = "MANUAL OVERRIDE" if is_manual else "RESCUE"
-        display_reasons = [r for r in reasons if r != "manual_keyboard_override"]
-        if display_reasons:
-            sub += ": " + ",".join(display_reasons)
-
-    if sub:
-        cv2.putText(img, sub, (12, y - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                    (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(img, sub, (12, y - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                    main_color, 1, cv2.LINE_AA)
-    return img
 
 
 def _annotate_rescue_frames(frames: list, rescue_log: list, window: int) -> list:
@@ -1306,15 +1291,11 @@ def _annotate_rescue_frames(frames: list, rescue_log: list, window: int) -> list
     out = []
     ev_idx = 0
     active_until = -1
-    active_p = 0.0
-    active_s = 0.0
     active_reasons: list = []
     for i, frm in enumerate(frames):
         frame_no = i + 1
         while ev_idx < len(events) and int(events[ev_idx]["frame"]) <= frame_no:
             active_until = int(events[ev_idx]["frame"]) + window - 1
-            active_p = float(events[ev_idx].get("progress", 0.0))
-            active_s = float(events[ev_idx].get("success", 0.0))
             active_reasons = list(events[ev_idx].get("reasons", []))
             ev_idx += 1
 
@@ -1323,20 +1304,19 @@ def _annotate_rescue_frames(frames: list, rescue_log: list, window: int) -> list
             h, w = img.shape[:2]
 
             is_manual = "manual_keyboard_override" in active_reasons
-            color = (0, 165, 255) if is_manual else (0, 0, 255)
-            prefix = "MANUAL OVERRIDE" if is_manual else "RESCUE"
+            color = (114, 255, 193) if is_manual else (0, 0, 255)
+            prefix = "DREAM TRIGGER" if is_manual else "RESCUE"
 
             cv2.rectangle(img, (0, 0), (w - 1, h - 1), color, 4)
 
-            txt = f"{prefix} p={active_p:.2f} s={active_s:.2f}"
-            cv2.putText(img, txt, (12, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+            cv2.putText(img, prefix, (12, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                         (0, 0, 0), 5, cv2.LINE_AA)
-            cv2.putText(img, txt, (12, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+            cv2.putText(img, prefix, (12, 36), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                         color, 2, cv2.LINE_AA)
 
-            if active_reasons:
-                display_reasons = [r for r in active_reasons if r != "manual_keyboard_override"]
-                sub = ",".join(display_reasons) if display_reasons else "Triggered by Keyboard"
+            display_reasons = [r for r in active_reasons if r != "manual_keyboard_override"]
+            if display_reasons:
+                sub = ",".join(display_reasons)
                 cv2.putText(img, sub, (12, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                             (0, 0, 0), 4, cv2.LINE_AA)
                 cv2.putText(img, sub, (12, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
