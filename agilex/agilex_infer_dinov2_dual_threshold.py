@@ -442,6 +442,7 @@ def _select_best_action_with_prefix(
     # sees in-distribution motion magnitudes.
     s = max(1, int(dd_action_stride))
     n_in = max(1, int(dd_action_chunk_in))
+    base_seed = int(time.time() * 1e6) % (2**31)
     tasks = [
         {
             "host": dd_host,
@@ -450,6 +451,7 @@ def _select_best_action_with_prefix(
                 action_chunks[i][:exec_horizon][::s][:n_in], dtype=np.float32
             ),
             "save_name": f"{save_prefix}/chunk_{i}",
+            "seed": base_seed + i,
         }
         for i in range(num_samples)
     ]
@@ -491,6 +493,7 @@ def _select_best_action_with_prefix(
             task["actions"], task["save_name"], task_description,
             frame_left_np=frame_left_img,
             frame_right_np=frame_right_img,
+            seed=task["seed"],
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, num_samples)) as ex:

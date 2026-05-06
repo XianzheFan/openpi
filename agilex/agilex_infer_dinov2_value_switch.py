@@ -204,7 +204,8 @@ class ValueExpertScorer:
 def _dreamdojo_generate(host: str, port: int, frame_np: np.ndarray, actions: np.ndarray,
                         save_name: str, task_description: str = "",
                         frame_left_np: np.ndarray | None = None,
-                        frame_right_np: np.ndarray | None = None) -> str | None:
+                        frame_right_np: np.ndarray | None = None,
+                        seed: int = 0) -> str | None:
     """Send a generation request to the DreamDojo server.
 
     For agilex_3view / new_agilex_3view experiments, pass `frame_left_np` and
@@ -223,6 +224,7 @@ def _dreamdojo_generate(host: str, port: int, frame_np: np.ndarray, actions: np.
         "actions": actions.tolist(),
         "save_name": save_name,
         "prompt": task_description,
+        "seed": int(seed),
     }
     if frame_left_np is not None and frame_right_np is not None:
         # Server expects identical (h, w) for all three views; resize on the
@@ -270,12 +272,14 @@ def _select_best_action_with_value_expert(
     frame_img = obs_snapshot["top"]
     save_prefix = step_save_dir.name
 
+    base_seed = int(time.time() * 1e6) % (2**31)
     tasks = [
         {
             "host": dd_host,
             "port": dd_base_port + i,
             "actions": np.array(action_chunks[i][:exec_horizon], dtype=np.float32),
             "save_name": f"{save_prefix}/chunk_{i}",
+            "seed": base_seed + i,
         }
         for i in range(num_samples)
     ]
@@ -283,7 +287,10 @@ def _select_best_action_with_value_expert(
     logging.info(f"[Switch] Launching {num_samples} parallel DreamDojo generation requests...")
 
     def _submit(t):
-        return _dreamdojo_generate(t["host"], t["port"], frame_img, t["actions"], t["save_name"], task_description)
+        return _dreamdojo_generate(
+            t["host"], t["port"], frame_img, t["actions"], t["save_name"],
+            task_description, seed=t["seed"],
+        )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_samples) as ex:
         futures = {ex.submit(_submit, t): i for i, t in enumerate(tasks)}
